@@ -1,0 +1,13 @@
+setuptools
+wheel
+numpy
+scikit-learn
+spacy
+openai>=1.14.0
+python-dotenv
+faiss-cpu
+networkx
+plotly
+pandas
+tiktoken
+matplotlib

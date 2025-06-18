@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!-- ... (YOUR HEAD SECTION UNCHANGED) ... -->
+<!-- CSS and style section remains as you provided -->
+</head>
+<body>
+<!-- ... (YOUR BODY SECTION UNCHANGED) ... -->
+
+<script>
+    const sampleData = {
+        nodes: [
+            {id: "Machine Learning", type: "CONCEPT", connections: 8},
+            {id: "Neural Networks", type: "CONCEPT", connections: 6},
+            {id: "Deep Learning", type: "CONCEPT", connections: 7},
+            {id: "NLP", type: "CONCEPT", connections: 5},
+            {id: "BERT", type: "MODEL", connections: 4},
+            {id: "GPT", type: "MODEL", connections: 5},
+            {id: "doc1", type: "DOCUMENT", connections: 12},
+            {id: "doc2", type: "DOCUMENT", connections: 8},
+            {id: "Transformer", type: "ARCHITECTURE", connections: 6},
+            {id: "Attention", type: "MECHANISM", connections: 4}
+        ],
+        links: [
+            {source: "Machine Learning", target: "doc1"},
+            {source: "Neural Networks", target: "doc1"},
+            {source: "Deep Learning", target: "doc1"},
+            {source: "Deep Learning", target: "Neural Networks"},
+            {source: "NLP", target: "doc2"},
+            {source: "BERT", target: "doc2"},
+            {source: "GPT", target: "doc2"},
+            {source: "BERT", target: "Transformer"},
+            {source: "GPT", target: "Transformer"},
+            {source: "Transformer", target: "Attention"},
+            {source: "NLP", target: "BERT"},
+            {source: "NLP", target: "GPT"}
+        ]
+    };
+
+    let svg, simulation, link, node, label, zoomContainer;
+    let showLabels = true;
+    let currentLayout = 'force';
+
+    function initGraph() {
+        const width = document.getElementById('graph-svg').clientWidth;
+        const height = document.getElementById('graph-svg').clientHeight;
+
+        svg = d3.select("#graph-svg")
+                .attr("viewBox", [0, 0, width, height]);
+
+        zoomContainer = svg.append("g");
+
+        const tooltip = d3.select("#tooltip");
+
+        // Create simulation
+        simulation = d3.forceSimulation(sampleData.nodes)
+            .force("link", d3.forceLink(sampleData.links).id(d => d.id).distance(120))
+            .force("charge", d3.forceManyBody().strength(-300))
+            .force("center", d3.forceCenter(width / 2, height / 2));
+
+        // Draw links
+        link = zoomContainer.selectAll(".link")
+            .data(sampleData.links)
+            .join("line")
+            .attr("class", "link");
+
+        // Draw nodes
+        node = zoomContainer.selectAll(".node")
+            .data(sampleData.nodes)
+            .join("circle")
+            .attr("class", "node")
+            .attr("r", 10)
+            .attr("fill", d => {
+                if (d.type === "DOCUMENT") return "#4FD1C5";
+                if (d.type === "MODEL") return "#F6AD55";
+                if (d.type === "CONCEPT") return "#90CDF4";
+                return "#A0AEC0";
+            })
+            .call(drag(simulation))
+            .on("mouseover", (event, d) => {
+                tooltip.style("display", "block")
+                       .html(`<strong>${d.id}</strong><br>Type: ${d.type}<br>Connections: ${d.connections}`)
+                       .style("left", (event.pageX + 10) + "px")
+                       .style("top", (event.pageY - 28) + "px");
+            })
+            .on("mouseout", () => tooltip.style("display", "none"));
+
+        // Add labels
+        label = zoomContainer.selectAll(".node-label")
+            .data(sampleData.nodes)
+            .join("text")
+            .attr("class", "node-label")
+            .text(d => d.id)
+            .style("display", showLabels ? "block" : "none");
+
+        simulation.on("tick", () => {
+            link.attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+
+            node.attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+
+            label.attr("x", d => d.x)
+                 .attr("y", d => d.y - 12);
+        });
+
+        // Zoom behavior
+        svg.call(d3.zoom()
+            .scaleExtent([0.5, 3])
+            .on("zoom", ({transform}) => zoomContainer.attr("transform", transform)));
+    }
+
+    function drag(simulation) {
+        return d3.drag()
+            .on("start", (event, d) => {
+                if (!event.active) simulation.alphaTarget(0.3).restart();
+                d.fx = d.x;
+                d.fy = d.y;
+            })
+            .on("drag", (event, d) => {
+                d.fx = event.x;
+                d.fy = event.y;
+            })
+            .on("end", (event, d) => {
+                if (!event.active) simulation.alphaTarget(0);
+                d.fx = null;
+                d.fy = null;
+            });
+    }
+
+    function toggleLabels() {
+        showLabels = !showLabels;
+        label.style("display", showLabels ? "block" : "none");
+    }
+
+    function resetZoom() {
+        svg.transition().duration(750).call(
+            d3.zoom().transform,
+            d3.zoomIdentity,
+            d3.zoomTransform(svg.node()).invert([svg.attr("width") / 2, svg.attr("height") / 2])
+        );
+    }
+
+    function setLayout(layout) {
+        currentLayout = layout;
+
+        // Remove existing forces
+        simulation.force("x", null);
+        simulation.force("y", null);
+
+        if (layout === 'circular') {
+            const radius = 200;
+            const centerX = document.getElementById('graph-svg').clientWidth / 2;
+            const centerY = document.getElementById('graph-svg').clientHeight / 2;
+
+            sampleData.nodes.forEach((d, i) => {
+                d.fx = centerX + radius * Math.cos((2 * Math.PI * i) / sampleData.nodes.length);
+                d.fy = centerY + radius * Math.sin((2 * Math.PI * i) / sampleData.nodes.length);
+            });
+
+            simulation.alpha(1).restart();
+        } else if (layout === 'hierarchical') {
+            sampleData.nodes.forEach((d, i) => {
+                d.fx = (i % 5) * 150 + 100;
+                d.fy = Math.floor(i / 5) * 150 + 100;
+            });
+
+            simulation.alpha(1).restart();
+        } else {
+            sampleData.nodes.forEach(d => {
+                d.fx = null;
+                d.fy = null;
+            });
+            simulation.force("center", d3.forceCenter(document.getElementById('graph-svg').clientWidth / 2, 300));
+            simulation.alpha(1).restart();
+        }
+
+        // Update button styles
+        document.querySelectorAll('.controls .btn').forEach(btn => btn.classList.remove('active'));
+        document.querySelector(`.controls .btn[onclick="setLayout('${layout}')"]`)?.classList.add('active');
+    }
+
+    window.onload = () => {
+        initGraph();
+    };
+  </script>
+</body>
+</html>

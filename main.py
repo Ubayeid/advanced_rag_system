@@ -1,0 +1,2932 @@
+# import asyncio
+# import json
+# import numpy as np
+# from datetime import datetime
+# from typing import List, Dict, Any, Optional, Tuple
+# from dataclasses import dataclass, field
+# from pathlib import Path
+# import uuid
+# import logging
+# import re
+# import os
+# from dotenv import load_dotenv
+# import sys
+# import hashlib
+
+# # Core libraries
+# import faiss
+# import networkx as nx
+# from sklearn.feature_extraction.text import TfidfVectorizer
+# import spacy
+# from spacy.matcher import Matcher, PhraseMatcher
+
+# # OpenAI & Sentence Transformers
+# from openai import OpenAI
+# from sentence_transformers import SentenceTransformer
+
+# # Setup logging
+# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# logger = logging.getLogger(__name__)
+
+# # Load environment variables
+# load_dotenv()
+
+# # Configuration Constants (can be moved to a config file)
+# EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-ada-002")
+# LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-3.5-turbo")
+# EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536")) # Ada-002 dimension
+# CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
+# CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "100"))
+# STORAGE_PATH = Path(os.getenv("STORAGE_PATH", "./storage"))
+# DATA_PATH = Path(os.getenv("DATA_PATH", "./data"))
+
+# # --- Persistence Paths ---
+# FAISS_INDEX_PATH = STORAGE_PATH / "faiss_index.bin"
+# CHUNK_METADATA_PATH = STORAGE_PATH / "chunk_metadata.json"
+# ID_TO_INDEX_PATH = STORAGE_PATH / "id_to_index.json"
+# INDEX_TO_ID_PATH = STORAGE_PATH / "index_to_id.json"
+# KG_GRAPH_PATH = STORAGE_PATH / "kg_graph.gml" # GML for NetworkX graph
+# KG_ENTITIES_PATH = STORAGE_PATH / "kg_entities.json"
+# KG_RELATIONS_PATH = STORAGE_PATH / "kg_relations.json"
+# LAST_DATA_HASH_PATH = STORAGE_PATH / "data_hash.txt"
+
+# # Ensure storage and data directory exist
+# STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+# DATA_PATH.mkdir(parents=True, exist_ok=True)
+
+# # =============================================================================
+# # 1. DATA STRUCTURES
+# # =============================================================================
+
+# @dataclass
+# class DocumentChunk:
+#     id: str
+#     document_id: str
+#     content: str
+#     chunk_index: int
+#     embedding: Optional[np.ndarray] = None # Make optional for initial creation
+#     keywords: List[str] = field(default_factory=list)
+#     entities: List[Dict[str, Any]] = field(default_factory=list)
+#     metadata: Dict[str, Any] = field(default_factory=dict)
+
+#     def to_dict(self):
+#         return {
+#             'id': self.id,
+#             'document_id': self.document_id,
+#             'content': self.content,
+#             'chunk_index': self.chunk_index,
+#             'embedding': self.embedding.tolist() if self.embedding is not None else None,
+#             'keywords': self.keywords,
+#             'entities': self.entities,
+#             'metadata': self.metadata
+#         }
+
+#     @staticmethod
+#     def from_dict(data: Dict[str, Any]):
+#         return DocumentChunk(
+#             id=data['id'],
+#             document_id=data['document_id'],
+#             content=data['content'],
+#             chunk_index=data['chunk_index'],
+#             embedding=np.array(data['embedding']).astype(np.float32) if data['embedding'] is not None else None,
+#             keywords=data['keywords'],
+#             entities=data['entities'],
+#             metadata=data['metadata']
+#         )
+
+# @dataclass
+# class KnowledgeEntity:
+#     id: str
+#     name: str
+#     entity_type: str
+#     confidence: float
+#     document_ids: List[str] = field(default_factory=list)
+#     related_chunks: List[str] = field(default_factory=list)
+
+#     def to_dict(self):
+#         return self.__dict__
+
+#     @staticmethod
+#     def from_dict(data: Dict[str, Any]):
+#         return KnowledgeEntity(**data)
+
+# @dataclass
+# class KnowledgeRelation:
+#     id: str
+#     source_entity: str # ID of source entity
+#     target_entity: str # ID of target entity
+#     relation_type: str
+#     confidence: float
+#     document_id: Optional[str] = None # Document where relation was found
+#     sentence: Optional[str] = None # Sentence from which relation was extracted
+
+#     def to_dict(self):
+#         return self.__dict__
+
+#     @staticmethod
+#     def from_dict(data: Dict[str, Any]):
+#         return KnowledgeRelation(**data)
+
+# # =============================================================================
+# # 2. DOCUMENT PROCESSOR
+# # =============================================================================
+
+# class DocumentProcessor:
+#     def __init__(self):
+#         self.client = OpenAI(
+#             api_key=os.getenv("OPENAI_API_KEY"),
+#         )
+#         self.embedding_model = EMBEDDING_MODEL_NAME # The OpenAI model name
+
+#         try:
+#             self.nlp = spacy.load("en_core_web_sm")
+#             self.nlp.max_length = 2_000_000 # Increase max_length for larger documents
+#             self.matcher = Matcher(self.nlp.vocab)
+#             self.phrase_matcher = PhraseMatcher(self.nlp.vocab) # Initialize PhraseMatcher
+
+#             # --- 1. Define Custom Hydrology Entity Types (Rule-Based) ---
+#             # You might need to add these strings to spaCy's vocabulary if you train a custom model.
+#             # For rule-based, using a string for the ID is sufficient.
+
+#             # Hydrological Features (Water Bodies, Geological Features)
+#             water_body_terms = [
+#                 "river", "lake", "stream", "aquifer", "reservoir", "ocean", "sea",
+#                 "wetland", "marsh", "swamp", "estuary", "fjord", "bay", "lagoon",
+#                 "groundwater", "surface water", "drinking water", "dam", "canal",
+#                 "watershed", "basin", "drainage basin", "catchment area", "glacier", "ice cap"
+#             ]
+#             self.phrase_matcher.add("WATER_BODY", [self.nlp(text) for text in water_body_terms])
+
+#             # Hydrological Measurements/Parameters
+#             measurement_terms = [
+#                 "flow rate", "water level", "stage height", "precipitation", "rainfall", "snowfall",
+#                 "temperature", "salinity", "pH", "dissolved oxygen", "turbidity", "conductivity",
+#                 "discharge", "volume", "depth", "velocity", "humidity", "evaporation", "transpiration"
+#             ]
+#             self.phrase_matcher.add("HYDRO_MEASUREMENT", [self.nlp(text) for text in measurement_terms])
+
+#             # Pollutants/Chemicals (add common ones in hydrology)
+#             pollutant_terms = [
+#                 "nitrate", "phosphate", "sulfate", "mercury", "lead", "cadmium", "arsenic",
+#                 "pesticide", "herbicide", "heavy metal", "microplastic", "E. coli",
+#                 "contaminant", "pollutant", "nutrient", "algae"
+#             ]
+#             self.phrase_matcher.add("POLLUTANT", [self.nlp(text) for text in pollutant_terms])
+
+#             # Hydrological Events/Processes
+#             event_terms = [
+#                 "flood", "drought", "storm", "hurricane", "typhoon", "cyclone",
+#                 "runoff", "infiltration", "percolation", "erosion", "sedimentation",
+#                 "desalination", "recharge", "effluent", "discharge event"
+#             ]
+#             self.phrase_matcher.add("HYDRO_EVENT", [self.nlp(text) for text in event_terms])
+
+#             # Hydrological Infrastructure/Equipment
+#             infrastructure_terms = [
+#                 "gauge", "sensor", "monitor", "weather station", "well", "pump",
+#                 "treatment plant", "wastewater facility", "dam", "levee", "dyke", "pipe", "culvert"
+#             ]
+#             self.phrase_matcher.add("HYDRO_INFRASTRUCTURE", [self.nlp(text) for text in infrastructure_terms])
+
+#             # Hydrological Models/Software (e.g., specific software names)
+#             model_terms = [
+#                 "SWMM", "HEC-RAS", "MODFLOW", "VIC model", "WRF-Hydro", "WEAP"
+#             ]
+#             self.phrase_matcher.add("HYDRO_MODEL", [self.nlp(text) for text in model_terms])
+
+
+#             # --- 2. Define Custom Hydrology Relation Patterns ---
+#             # These patterns will connect the entities you define, and also spaCy's default entities (like GPE, ORG)
+
+#             # WATER_BODY FLOWS_INTO WATER_BODY
+#             self.matcher.add("FLOWS_INTO", [[
+#                 {"ENT_TYPE": {"IN": ["WATER_BODY", "GPE"]}}, # Can flow into/from a general place too
+#                 {"LEMMA": {"IN": ["flow", "drain", "empty", "discharge"]}},
+#                 {"POS": "ADP", "OP": "*"}, # optional preposition like "into", "to", "from"
+#                 {"ENT_TYPE": {"IN": ["WATER_BODY", "GPE"]}}
+#             ]])
+
+#             # HYDRO_INFRASTRUCTURE MEASURES HYDRO_MEASUREMENT/POLLUTANT
+#             self.matcher.add("MEASURES", [[
+#                 {"ENT_TYPE": "HYDRO_INFRASTRUCTURE"},
+#                 {"LEMMA": {"IN": ["measure", "detect", "record", "monitor", "gauge"]}},
+#                 {"ENT_TYPE": {"IN": ["HYDRO_MEASUREMENT", "POLLUTANT"]}}
+#             ]])
+
+#             # WATER_BODY CONTAINS POLLUTANT
+#             self.matcher.add("CONTAINS", [[
+#                 {"ENT_TYPE": "WATER_BODY"},
+#                 {"LEMMA": {"IN": ["contain", "have", "include", "exhibit"]}},
+#                 {"ENT_TYPE": "POLLUTANT"}
+#             ]])
+
+#             # HYDRO_EVENT CAUSES HYDRO_EVENT/IMPACT
+#             self.matcher.add("CAUSES", [[
+#                 {"ENT_TYPE": "HYDRO_EVENT"},
+#                 {"LEMMA": "cause"},
+#                 {"ENT_TYPE": {"IN": ["HYDRO_EVENT", "HYDRO_MEASUREMENT"]}} # e.g., flood causes high water level
+#             ]])
+
+#             # ORG/PERSON USES HYDRO_MODEL
+#             self.matcher.add("USES_MODEL", [[
+#                 {"ENT_TYPE": {"IN": ["ORG", "PERSON"]}},
+#                 {"LEMMA": {"IN": ["use", "apply", "employ", "utilize", "develop"]}},
+#                 {"ENT_TYPE": "HYDRO_MODEL"}
+#             ]])
+
+#             # STUDY/RESEARCH_PROJECT INVESTIGATES WATER_BODY/HYDRO_EVENT/POLLUTANT (assuming you define STUDY as entity)
+#             self.matcher.add("INVESTIGATES", [[
+#                 {"LOWER": {"IN": ["study", "research", "project", "analysis"]}}, # Can be noun for a study
+#                 {"LEMMA": {"IN": ["investigate", "analyze", "examine", "assess"]}},
+#                 {"ENT_TYPE": {"IN": ["WATER_BODY", "HYDRO_EVENT", "POLLUTANT", "HYDRO_MEASUREMENT"]}}
+#             ]])
+#             # You'd need to adapt _extract_entities to recognize 'study'/'research' as 'STUDY' entities for this to work well
+
+#         except OSError:
+#             logger.error("spaCy model 'en_core_web_sm' not found. Please install with: python -m spacy download en_core_web_sm")
+#             self.nlp = None
+#             self.matcher = None
+
+#         self.chunk_size = CHUNK_SIZE
+#         self.chunk_overlap = CHUNK_OVERLAP
+#         self.tfidf = TfidfVectorizer(max_features=100, stop_words='english')
+
+#     def _get_embedding(self, text: str) -> np.ndarray:
+#         """Generates embedding for a given text using OpenAI API."""
+#         try:
+#             response = self.client.embeddings.create(
+#                 model=self.embedding_model,
+#                 input=text
+#             )
+#             return np.array(response.data[0].embedding).astype(np.float32)
+#         except Exception as e:
+#             logger.error(f"Error getting embedding for text: {text[:50]}... Error: {e}")
+#             return np.zeros(EMBEDDING_DIM, dtype=np.float32) # Return a zero array on error
+
+#     def process_document(self, document_id: str, content: str) -> Tuple[List[DocumentChunk], List[KnowledgeEntity], List[KnowledgeRelation]]:
+#         """Process document into chunks with entities and relations"""
+#         logger.info(f"Processing document: {document_id}")
+#         cleaned_content = self._clean_text(content)
+
+#         # Extract entities first
+#         entities = self._extract_entities(cleaned_content, document_id)
+
+#         # Create chunks
+#         chunks = self._create_chunks(cleaned_content, document_id)
+
+#         # Generate embeddings
+#         for chunk in chunks:
+#             chunk.embedding = self._get_embedding(chunk.content)
+
+#         # Extract keywords
+#         self._extract_keywords(chunks)
+
+#         # Link entities to chunks
+#         self._link_entities_to_chunks(chunks, entities)
+
+#         # Create relations
+#         relations = self._create_relations(entities, cleaned_content, document_id) # Pass content for contextual relation extraction
+
+#         return chunks, entities, relations
+
+#     def _clean_text(self, content: str) -> str:
+#         content = re.sub(r'\s+', ' ', content)
+#         return content.strip()
+
+#     def _create_chunks(self, content: str, doc_id: str) -> List[DocumentChunk]:
+#         """Create overlapping chunks"""
+#         # Using spaCy for sentence-aware chunking for better context
+#         if self.nlp:
+#             doc = self.nlp(content)
+#             sentences = [sent.text for sent in doc.sents]
+#         else:
+#             sentences = content.split('.') # Fallback if spaCy not loaded
+
+#         chunks = []
+#         current_chunk_content = []
+#         current_chunk_len = 0
+#         chunk_index = 0
+
+#         for sent in sentences:
+#             sent_len = len(sent.split()) # Word count of sentence
+#             if current_chunk_len + sent_len <= self.chunk_size:
+#                 current_chunk_content.append(sent)
+#                 current_chunk_len += sent_len
+#             else:
+#                 if current_chunk_content: # Save current chunk if not empty
+#                     chunk_content = " ".join(current_chunk_content)
+#                     chunk = DocumentChunk(
+#                         id=str(uuid.uuid4()),
+#                         document_id=doc_id,
+#                         content=chunk_content,
+#                         chunk_index=chunk_index
+#                     )
+#                     chunks.append(chunk)
+#                     chunk_index += 1
+
+#                 # Start new chunk with overlap
+#                 overlap_content = " ".join(current_chunk_content[-(self.chunk_overlap // 10):]) # Simple overlap, last few sentences
+#                 current_chunk_content = [overlap_content.strip(), sent] if overlap_content else [sent]
+#                 current_chunk_len = len(overlap_content.split()) + sent_len
+
+#         if current_chunk_content: # Add the last chunk
+#             chunk_content = " ".join(current_chunk_content)
+#             chunk = DocumentChunk(
+#                 id=str(uuid.uuid4()),
+#                 document_id=doc_id,
+#                 content=chunk_content,
+#                 chunk_index=chunk_index
+#             )
+#             chunks.append(chunk)
+
+#         return chunks
+
+#     def _extract_entities(self, content: str, doc_id: str) -> List[KnowledgeEntity]:
+#         """Extract named entities using spaCy NER"""
+#         entities = []
+#         if not self.nlp:
+#             return entities
+
+#         doc = self.nlp(content)
+#         seen_entities = set() # To avoid duplicate entities with same name and type
+
+#         for ent in doc.ents:
+#             # Filter out very short entities or purely numerical ones if not relevant (e.g., "100")
+#             if len(ent.text.strip()) < 2 or ent.text.strip().isnumeric():
+#                 continue
+
+#             entity_key = (ent.text.lower(), ent.label_) # Use lower for name matching
+#             if entity_key not in seen_entities:
+#                 entity = KnowledgeEntity(
+#                     id=str(uuid.uuid4()),
+#                     name=ent.text,
+#                     entity_type=ent.label_,
+#                     confidence=0.9, # SpaCy's NER is usually high confidence
+#                     document_ids=[doc_id]
+#                 )
+#                 entities.append(entity)
+#                 seen_entities.add(entity_key)
+#         return entities
+
+#     def _extract_keywords(self, chunks: List[DocumentChunk]):
+#         """Extract keywords using TF-IDF"""
+#         if not chunks:
+#             return
+
+#         try:
+#             texts = [chunk.content for chunk in chunks]
+#             # Fit TF-IDF only if there's enough data and not all texts are empty
+#             if all(not t.strip() for t in texts): # Check if all texts are empty
+#                 logger.warning("No content in chunks for TF-IDF keyword extraction.")
+#                 return
+
+#             self.tfidf.fit(texts) # Fit on all chunk texts
+#             feature_names = self.tfidf.get_feature_names_out()
+
+#             for i, chunk in enumerate(chunks):
+#                 # Only transform if the text is not empty, otherwise it causes errors
+#                 if chunk.content.strip():
+#                     tfidf_matrix = self.tfidf.transform([chunk.content])
+#                     scores = tfidf_matrix.toarray()[0]
+#                     # Select top 5 keywords with score > 0
+#                     top_indices = scores.argsort()[-5:][::-1]
+#                     chunk.keywords = [feature_names[idx] for idx in top_indices if scores[idx] > 0]
+#                 else:
+#                     chunk.keywords = []
+#         except Exception as e:
+#             logger.error(f"Error during TF-IDF keyword extraction: {e}")
+#             for chunk in chunks:
+#                 chunk.keywords = []
+
+#     def _link_entities_to_chunks(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity]):
+#         """Link entities to chunks where they appear and add chunk IDs to entity.related_chunks."""
+#         entity_name_to_id = {ent.name.lower(): ent.id for ent in entities}
+
+#         for chunk in chunks:
+#             for ent_name_lower, ent_id in entity_name_to_id.items():
+#                 # Check for entity name (case-insensitive) in chunk content
+#                 if ent_name_lower in chunk.content.lower():
+#                     # Find the actual entity object by ID to update its related_chunks
+#                     original_entity = next((e for e in entities if e.id == ent_id), None)
+#                     if original_entity:
+#                         # Ensure no duplicate entries
+#                         if chunk.id not in original_entity.related_chunks:
+#                             original_entity.related_chunks.append(chunk.id)
+#                         # Add entity metadata to chunk
+#                         if not any(e['id'] == ent_id for e in chunk.entities):
+#                             chunk.entities.append({
+#                                 'id': original_entity.id,
+#                                 'name': original_entity.name,
+#                                 'type': original_entity.entity_type
+#                             })
+
+#     def _create_relations(self, entities: List[KnowledgeEntity], full_content: str, doc_id: str) -> List[KnowledgeRelation]:
+#         """
+#         Create relations using spaCy's dependency parser and rule-based patterns.
+#         Falls back to co-occurrence if patterns don't match.
+#         """
+#         relations = []
+#         if not self.nlp or not self.matcher:
+#             return relations
+
+#         doc = self.nlp(full_content)
+#         entity_map = {ent.name: ent for ent in entities} # Map name to entity object
+
+#         # Rule-based extraction using spaCy Matcher
+#         matches = self.matcher(doc)
+#         for match_id, start, end in matches:
+#             span = doc[start:end]
+#             rule_name = self.nlp.vocab.strings[match_id]
+
+#             # Find entities within the matched span
+#             span_entities = [ent for ent in span.ents if ent.text in entity_map]
+
+#             if len(span_entities) >= 2:
+#                 # Prioritize rule-based relation types
+#                 source_ent = entity_map[span_entities[0].text]
+#                 target_ent = entity_map[span_entities[1].text] # Simple, could be more complex logic for multiple entities
+
+#                 if source_ent.id != target_ent.id: # Avoid self-loops
+
+#                     relation_type = rule_name # Start with the rule name itself
+
+#                     # to make it "FLOWS_INTO" specifically between two WATER_BODY entities.
+#                     if rule_name == "FLOWS_INTO" and (source_ent.entity_type == "WATER_BODY" or source_ent.entity_type == "GPE") and \
+#                         (target_ent.entity_type == "WATER_BODY" or target_ent.entity_type == "GPE"):
+#                         # Confirm it's a flow relation between relevant types
+#                         relation_type = "FLOWS_INTO"
+#                     elif rule_name == "MEASURES" and source_ent.entity_type == "HYDRO_INFRASTRUCTURE" and \
+#                         target_ent.entity_type in ["HYDRO_MEASUREMENT", "POLLUTANT"]:
+#                         # Confirm an infrastructure measures a measurement or pollutant
+#                         relation_type = "MEASURES"
+#                     elif rule_name == "CONTAINS" and source_ent.entity_type == "WATER_BODY" and \
+#                         target_ent.entity_type == "POLLUTANT":
+#                         relation_type = "CONTAINS"
+#                     elif rule_name == "CAUSES" and source_ent.entity_type == "HYDRO_EVENT" and \
+#                         target_ent.entity_type in ["HYDRO_EVENT", "HYDRO_MEASUREMENT"]:
+#                         relation_type = "CAUSES"
+#                     elif rule_name == "USES_MODEL" and source_ent.entity_type in ["ORG", "PERSON"] and \
+#                         target_ent.entity_type == "HYDRO_MODEL":
+#                         relation_type = "USES_MODEL"
+#                     elif rule_name == "INVESTIGATES" and source_ent.entity_type in ["STUDY"] and \
+#                         target_ent.entity_type in ["WATER_BODY", "HYDRO_EVENT", "POLLUTANT", "HYDRO_MEASUREMENT"]:
+#                         # Assuming 'STUDY' entity type is defined elsewhere in your _extract_entities
+#                         relation_type = "INVESTIGATES"
+#                     else:
+#                         # Fallback for any other rule_name that doesn't fit the specific refinements above
+#                         # or if you used a more generic 'RELATED_TO' pattern in your Matcher.add calls
+#                         relation_type = "RELATED_TO_VIA_RULE" # More descriptive than just "RELATED_TO"
+
+#                     # Add extracted_relations_set later to prevent duplicates
+#                     relations.append(KnowledgeRelation(
+#                         id=str(uuid.uuid4()),
+#                         source_entity=source_ent.id,
+#                         target_entity=target_ent.id,
+#                         relation_type=relation_type,
+#                         confidence=0.9, # High confidence for rule matches
+#                         document_id=doc_id,
+#                         sentence=span.text # The sentence segment where the relation was found
+#                     ))
+
+#         # Fallback to co-occurrence for entities in the same sentence if no specific rule applied
+#         # This is less precise but captures broader relationships.
+#         for sent in doc.sents:
+#             sent_entities = [ent for ent in sent.ents if ent.text in entity_map]
+#             if len(sent_entities) >= 2:
+#                 for i, ent1_span in enumerate(sent_entities):
+#                     for j, ent2_span in enumerate(sent_entities):
+#                         if i < j:
+#                             source_ent = entity_map[ent1_span.text]
+#                             target_ent = entity_map[ent2_span.text]
+
+#                             # Check if a specific relation already exists between these entities in this sentence
+#                             existing_relation = next((r for r in relations if
+#                                 (r.source_entity == source_ent.id and r.target_entity == target_ent.id) or
+#                                 (r.source_entity == target_ent.id and r.target_entity == source_ent.id)), None)
+
+#                             if not existing_relation: # If no specific rule applied, add co-occurrence
+#                                 relations.append(KnowledgeRelation(
+#                                     id=str(uuid.uuid4()),
+#                                     source_entity=source_ent.id,
+#                                     target_entity=target_ent.id,
+#                                     relation_type='CO_OCCURS',
+#                                     confidence=0.5, # Lower confidence for co-occurrence
+#                                     document_id=doc_id,
+#                                     sentence=sent.text
+#                                 ))
+#         return relations
+
+
+# # =============================================================================
+# # 3. VECTOR INDEX MANAGER
+# # =============================================================================
+
+# class VectorIndexManager:
+#     def __init__(self, embedding_dim: int = EMBEDDING_DIM):
+#         self.embedding_dim = embedding_dim
+#         self.index: Optional[faiss.IndexFlatIP] = None # Initialize as None
+#         self.chunk_metadata: Dict[str, Any] = {} 
+#         self.id_to_index: Dict[str, int] = {}
+#         self.index_to_id: Dict[int, str] = {}
+#         self.current_index = 0
+#         self._initialize_index()
+
+#     def _initialize_index(self):
+#         self.index = faiss.IndexFlatIP(self.embedding_dim)
+
+#     def add_chunks(self, chunks: List[DocumentChunk]):
+#         """Add chunks to vector index"""
+#         if not chunks:
+#             return
+        
+#         embeddings_to_add = []
+#         for chunk in chunks:
+#             if chunk.embedding is not None and chunk.id not in self.id_to_index: # Only add new chunks
+#                 embeddings_to_add.append(chunk.embedding)
+                
+#                 # Store metadata
+#                 self.chunk_metadata[chunk.id] = chunk.to_dict() # Use to_dict for serialization
+                
+#                 # Store mappings
+#                 self.id_to_index[chunk.id] = self.current_index
+#                 self.index_to_id[self.current_index] = chunk.id
+#                 self.current_index += 1
+#             elif chunk.id in self.id_to_index:
+#                 # Update existing chunk metadata if content might have changed (though in this flow, it's new docs)
+#                 self.chunk_metadata[chunk.id] = chunk.to_dict()
+
+#         if embeddings_to_add:
+#             embeddings_array = np.array(embeddings_to_add).astype('float32')
+#             self.index.add(embeddings_array)
+#             logger.info(f"Added {len(embeddings_to_add)} new embeddings to FAISS index. Total: {self.index.ntotal}")
+
+#     def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
+#         """Search for similar chunks"""
+#         if self.index.ntotal == 0:
+#             logger.warning("FAISS index is empty. No search results.")
+#             return []
+        
+#         query_embedding = np.array([query_embedding]).astype('float32')
+#         distances, indices = self.index.search(query_embedding, min(k, self.index.ntotal))
+        
+#         results = []
+#         for dist, idx in zip(distances[0], indices[0]):
+#             if idx in self.index_to_id:
+#                 chunk_id = self.index_to_id[idx]
+#                 chunk_dict = self.chunk_metadata.get(chunk_id, {})
+                
+#                 if chunk_dict:
+#                     # Convert back to DocumentChunk object or use dict directly
+#                     # For search results, dict is fine to avoid unnecessary object creation
+#                     result_item = {
+#                         'chunk_id': chunk_id,
+#                         'similarity_score': float(dist),
+#                         'content': chunk_dict.get('content', ''),
+#                         'document_id': chunk_dict.get('document_id', ''),
+#                         'keywords': chunk_dict.get('keywords', []),
+#                         'entities': chunk_dict.get('entities', [])
+#                     }
+#                     results.append(result_item)
+#             else:
+#                 logger.warning(f"Index {idx} not found in index_to_id mapping. Data inconsistency.")
+        
+#         return results
+
+#     def save_index(self):
+#         """Saves the FAISS index and associated metadata."""
+#         try:
+#             faiss.write_index(self.index, str(FAISS_INDEX_PATH))
+#             with open(CHUNK_METADATA_PATH, 'w', encoding='utf-8') as f:
+#                 json.dump({cid: data for cid, data in self.chunk_metadata.items()}, f, indent=2)
+#             with open(ID_TO_INDEX_PATH, 'w', encoding='utf-8') as f:
+#                 json.dump(self.id_to_index, f, indent=2)
+#             with open(INDEX_TO_ID_PATH, 'w', encoding='utf-8') as f:
+#                 # Convert int keys to str for JSON serialization if necessary
+#                 json.dump({str(k): v for k, v in self.index_to_id.items()}, f, indent=2)
+#             logger.info("FAISS index and metadata saved.")
+#         except Exception as e:
+#             logger.error(f"Error saving FAISS index: {e}")
+
+#     def load_index(self):
+#         """Loads the FAISS index and associated metadata."""
+#         if (FAISS_INDEX_PATH.exists() and CHUNK_METADATA_PATH.exists() and
+#             ID_TO_INDEX_PATH.exists() and INDEX_TO_ID_PATH.exists()):
+#             try:
+#                 self.index = faiss.read_index(str(FAISS_INDEX_PATH))
+#                 with open(CHUNK_METADATA_PATH, 'r', encoding='utf-8') as f:
+#                     # No need to convert dicts to DocumentChunk objects at load time for search
+#                     # Only convert when you need to interact with the objects directly
+#                     self.chunk_metadata = json.load(f)
+#                 with open(ID_TO_INDEX_PATH, 'r', encoding='utf-8') as f:
+#                     self.id_to_index = json.load(f)
+#                 with open(INDEX_TO_ID_PATH, 'r', encoding='utf-8') as f:
+#                     # Convert str keys back to int
+#                     self.index_to_id = {int(k): v for k, v in json.load(f).items()}
+                
+#                 self.current_index = self.index.ntotal
+#                 logger.info(f"FAISS index and metadata loaded. Total items: {self.index.ntotal}")
+#                 return True
+#             except Exception as e:
+#                 logger.error(f"Error loading FAISS index, restarting from scratch: {e}")
+#                 self._initialize_index() # Re-initialize if load fails
+#                 return False
+#         logger.info("No existing FAISS index found. Starting fresh.")
+#         return False
+
+# # =============================================================================
+# # 4. KNOWLEDGE GRAPH MANAGER
+# # =============================================================================
+
+# class KnowledgeGraphManager:
+#     def __init__(self):
+#         self.graph = nx.DiGraph() # Directed graph for relations
+#         self.entities: Dict[str, KnowledgeEntity] = {}
+#         self.relations: Dict[str, KnowledgeRelation] = {}
+#         self.document_chunks: Dict[str, DocumentChunk] = {} # Store chunk objects for KG nodes
+
+#     def add_data(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity], relations: List[KnowledgeRelation]):
+#         """Add entities, relations, and chunks to the graph."""
+#         # Add chunks as nodes first
+#         for chunk in chunks:
+#             if chunk.id not in self.document_chunks:
+#                 self.document_chunks[chunk.id] = chunk
+#                 self.graph.add_node(chunk.id, type='CHUNK', content=chunk.content[:100] + '...') # Store snippet
+
+#         # Add entities
+#         for entity in entities:
+#             if entity.id not in self.entities:
+#                 self.entities[entity.id] = entity
+#                 self.graph.add_node(entity.id, name=entity.name, type=entity.entity_type)
+#             else:
+#                 # Update existing entity's document and chunk lists if it's new data
+#                 existing_entity = self.entities[entity.id]
+#                 existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
+#                 existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
+#                 self.graph.nodes[entity.id]['name'] = entity.name # Ensure name is updated if needed
+
+#             # Add MENTIONS relations between chunks and entities
+#             for chunk_id in entity.related_chunks:
+#                 if chunk_id in self.graph and entity.id in self.graph:
+#                     # Check if edge already exists to avoid duplicates
+#                     if not self.graph.has_edge(chunk_id, entity.id):
+#                         self.graph.add_edge(chunk_id, entity.id, relation_type='MENTIONS', confidence=1.0)
+#                     if not self.graph.has_edge(entity.id, chunk_id): # Bi-directional for easier traversal
+#                         self.graph.add_edge(entity.id, chunk_id, relation_type='MENTIONED_IN', confidence=1.0)
+
+
+#         # Add relations (between entities)
+#         for relation in relations:
+#             # Only add if both source and target entities exist in the graph
+#             if relation.source_entity in self.graph and relation.target_entity in self.graph:
+#                 if relation.id not in self.relations:
+#                     self.relations[relation.id] = relation
+#                     self.graph.add_edge(
+#                         relation.source_entity,
+#                         relation.target_entity,
+#                         relation_type=relation.relation_type,
+#                         confidence=relation.confidence,
+#                         document_id=relation.document_id,
+#                         sentence=relation.sentence
+#                     )
+#             else:
+#                 logger.warning(f"Skipping relation {relation.id}: source or target entity not in graph.")
+#         logger.info(f"Added {len(entities)} entities, {len(relations)} relations, and {len(chunks)} chunks to KG. Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}")
+
+#     def get_related_info(self, query_entities: List[str], max_distance: int = 2) -> List[Dict[str, Any]]:
+#         """
+#         Get entities and related chunks connected to the given query entities,
+#         traversing the knowledge graph.
+#         """
+#         related_info = []
+#         seen_nodes = set()
+
+#         # Find entity IDs from query names
+#         query_entity_ids = []
+#         for q_ent_name in query_entities:
+#             for eid, entity_obj in self.entities.items():
+#                 if entity_obj.name.lower() == q_ent_name.lower():
+#                     query_entity_ids.append(eid)
+#                     break
+
+#         if not query_entity_ids:
+#             return []
+
+#         for start_node_id in query_entity_ids:
+#             if start_node_id not in self.graph:
+#                 continue
+
+#             # BFS to find nodes within max_distance
+#             for source, target in nx.bfs_edges(self.graph, start_node_id, depth_limit=max_distance):
+#                 path = nx.shortest_path(self.graph, source=start_node_id, target=target)
+#                 distance = len(path) - 1
+
+#                 if target not in seen_nodes:
+#                     node_data = self.graph.nodes[target]
+#                     info_item = {
+#                         'id': target,
+#                         'type': node_data.get('type'),
+#                         'distance_from_query_entity': distance
+#                     }
+
+#                     if node_data.get('type') == 'CHUNK':
+#                         chunk_obj = self.document_chunks.get(target)
+#                         if chunk_obj:
+#                             info_item['content_snippet'] = chunk_obj.content[:200] + "..."
+#                             info_item['document_id'] = chunk_obj.document_id
+#                         else:
+#                             info_item['content_snippet'] = node_data.get('content', '')
+#                             info_item['document_id'] = "UNKNOWN"
+#                     elif node_data.get('type') in ['PERSON', 'ORG', 'GPE', 'MISC', 'DATE', 'MONEY']:
+#                         info_item['name'] = node_data.get('name')
+#                         # Add a snippet about what connects it back to the query entity
+#                         if len(path) > 1:
+#                             connecting_edge_data = self.graph.get_edge_data(path[-2], path[-1])
+#                             if connecting_edge_data:
+#                                 info_item['connection_type'] = connecting_edge_data.get('relation_type', 'unknown')
+#                                 info_item['connection_confidence'] = connecting_edge_data.get('confidence', 0.0)
+
+#                     related_info.append(info_item)
+#                     seen_nodes.add(target)
+
+#         return related_info
+
+#     def save_graph(self):
+#         """Saves the NetworkX graph and associated entity/relation data."""
+#         try:
+#             nx.write_gml(self.graph, str(KG_GRAPH_PATH)) # GML is a good format for NetworkX
+
+#             with open(KG_ENTITIES_PATH, 'w', encoding='utf-8') as f:
+#                 json.dump({eid: entity.to_dict() for eid, entity in self.entities.items()}, f, indent=2)
+#             with open(KG_RELATIONS_PATH, 'w', encoding='utf-8') as f:
+#                 json.dump({rid: relation.to_dict() for rid, relation in self.relations.items()}, f, indent=2)
+
+#             # Save document chunks
+#             # We don't save embeddings here, as they are in FAISS, just metadata
+#             chunks_to_save = {cid: chunk.to_dict() for cid, chunk in self.document_chunks.items()}
+#             for cid in chunks_to_save: # Remove embeddings to save space
+#                 if 'embedding' in chunks_to_save[cid]:
+#                     chunks_to_save[cid]['embedding'] = None # Don't save embeddings here
+#             with open(STORAGE_PATH / "kg_chunks.json", 'w', encoding='utf-8') as f:
+#                 json.dump(chunks_to_save, f, indent=2)
+
+#             logger.info("Knowledge Graph and associated data saved.")
+#         except Exception as e:
+#             logger.error(f"Error saving Knowledge Graph: {e}")
+
+#     def load_graph(self):
+#         """Loads the NetworkX graph and associated entity/relation data."""
+#         kg_chunks_path = STORAGE_PATH / "kg_chunks.json"
+#         if (KG_GRAPH_PATH.exists() and KG_ENTITIES_PATH.exists() and
+#             KG_RELATIONS_PATH.exists() and kg_chunks_path.exists()):
+#             try:
+#                 self.graph = nx.read_gml(str(KG_GRAPH_PATH))
+
+#                 with open(KG_ENTITIES_PATH, 'r', encoding='utf-8') as f:
+#                     self.entities = {eid: KnowledgeEntity.from_dict(data) for eid, data in json.load(f).items()}
+#                 with open(KG_RELATIONS_PATH, 'r', encoding='utf-8') as f:
+#                     self.relations = {rid: KnowledgeRelation.from_dict(data) for rid, data in json.load(f).items()}
+#                 with open(kg_chunks_path, 'r', encoding='utf-8') as f:
+#                     self.document_chunks = {cid: DocumentChunk.from_dict(data) for cid, data in json.load(f).items()}
+
+#                 logger.info(f"Knowledge Graph loaded. Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}")
+#                 return True
+#             except Exception as e:
+#                 logger.error(f"Error loading Knowledge Graph, restarting from scratch: {e}")
+#                 self.graph = nx.DiGraph() # Re-initialize if load fails
+#                 return False
+#         logger.info("No existing Knowledge Graph found. Starting fresh.")
+#         return False
+
+# # =============================================================================
+# # 5. QUERY PROCESSOR
+# # =============================================================================
+
+# class QueryProcessor:
+#     def __init__(self):
+#         try:
+#             self.nlp = spacy.load("en_core_web_sm")
+#         except OSError:
+#             logger.error("spaCy model 'en_core_web_sm' not found for QueryProcessor. Install with: python -m spacy download en_core_web_sm")
+#             self.nlp = None
+
+#         self.query_types = {
+#             'factual': ['what', 'who', 'when', 'where', 'which', 'how many'],
+#             'explanatory': ['how', 'why', 'explain', 'describe', 'tell me about'],
+#             'comparative': ['compare', 'versus', 'difference', 'similarities'],
+#             'procedural': ['steps', 'process', 'procedure', 'how to'],
+#             'definition': ['what is', 'define']
+#         }
+#         self.stop_words = self.nlp.Defaults.stop_words if self.nlp else set()
+
+
+#     def analyze_query(self, query: str) -> Dict[str, Any]:
+#         """Analyze query to understand intent and extract entities/keywords."""
+#         query_lower = query.lower()
+#         doc = self.nlp(query) if self.nlp else None
+
+#         # Classify query type
+#         query_type = 'general'
+#         for qtype, indicators in self.query_types.items():
+#             if any(indicator in query_lower for indicator in indicators):
+#                 query_type = qtype
+#                 break
+
+#         # Extract keywords (more robust with spaCy)
+#         keywords = []
+#         if doc:
+#             keywords = [token.lemma_ for token in doc if token.is_alpha and not token.is_stop and not token.is_punct and len(token.lemma_) > 2]
+#             keywords = list(set(keywords)) # Remove duplicates
+
+#         # Extract entities using spaCy's NER
+#         entities = []
+#         if doc:
+#             for ent in doc.ents:
+#                 entities.append({'text': ent.text, 'label': ent.label_})
+
+#         # Conceptual Entity Resolution/Linking (Placeholder)
+#         # In a real system, you'd integrate with an EL model or knowledge base here
+#         # For example:
+#         # resolved_entities = self._resolve_entities(entities)
+#         # For now, we'll just use the extracted text.
+#         extracted_entity_names = [e['text'] for e in entities if e['label'] in ['PERSON', 'ORG', 'GPE', 'NORP', 'FAC']]
+
+#         return {
+#             'original_query': query,
+#             'query_type': query_type,
+#             'keywords': keywords,
+#             'entities': extracted_entity_names,
+#             'complexity': 'simple' if len(query.split()) < 5 else 'medium' if len(query.split()) < 15 else 'complex'
+#         }
+
+#     def _resolve_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+#         """
+#         Placeholder for entity resolution/linking.
+#         This would typically involve calling an external service or a more complex model
+#         to link entities to canonical IDs (e.g., Wikidata, DBpedia).
+#         """
+#         resolved = []
+#         for ent in entities:
+#             # Mock resolution: just return original for now
+#             resolved_ent = ent.copy()
+#             resolved_ent['canonical_id'] = None # Or some mock ID
+#             resolved.append(resolved_ent)
+#         return resolved
+
+# # =============================================================================
+# # 6. HYBRID RETRIEVAL ENGINE
+# # =============================================================================
+
+# class HybridRetrievalEngine:
+#     def __init__(self, vector_index: VectorIndexManager, kg_manager: KnowledgeGraphManager):
+#         self.vector_index = vector_index
+#         self.kg_manager = kg_manager
+#         self.query_processor = QueryProcessor()
+#         self.client = OpenAI(
+#             api_key=os.getenv("OPENAI_API_KEY"),
+#         )
+#         self.embedding_model = EMBEDDING_MODEL_NAME
+
+#         # Cross-encoder for re-ranking (placeholder)
+#         # In a real scenario, load a specific cross-encoder model
+#         # self.cross_encoder = SentenceTransformer('cross-encoder/ms-marco-MiniLM-L-6-v2')
+#         self.cross_encoder = None # For now, just use mock
+
+#     def _get_embedding(self, text: str) -> np.ndarray:
+#         """Generates embedding for a given text using OpenAI API."""
+#         try:
+#             response = self.client.embeddings.create(
+#                 model=self.embedding_model,
+#                 input=text
+#             )
+#             return np.array(response.data[0].embedding).astype(np.float32)
+#         except Exception as e:
+#             logger.error(f"Error getting embedding for query: {text[:50]}... Error: {e}")
+#             return np.zeros(EMBEDDING_DIM, dtype=np.float32) # Return a zero array on error
+
+#     def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+#         """Hybrid retrieval combining vector search and knowledge graph, with re-ranking."""
+#         query_analysis = self.query_processor.analyze_query(query)
+
+#         query_embedding = self._get_embedding(query)
+
+#         # 1. Initial Vector Search (Retrieve more candidates than final top_k)
+#         vector_candidates = self.vector_index.search(query_embedding, top_k * 5) # Retrieve more for re-ranking
+
+#         # 2. Knowledge Graph Enhancement
+#         kg_related_info = self.kg_manager.get_related_info(query_analysis.get('entities', []))
+
+#         # Boost vector results based on KG relatedness and keyword overlap
+#         enhanced_candidates = self._enhance_and_boost_candidates(vector_candidates, query_analysis, kg_related_info)
+
+#         # Add KG-derived chunks as candidates if they are not already in vector_candidates
+#         # This prevents completely isolated but relevant KG info from being missed
+#         kg_chunk_candidates = []
+#         for item in kg_related_info:
+#             if item['type'] == 'CHUNK':
+#                 chunk_id = item['id']
+#                 if not any(c['chunk_id'] == chunk_id for c in enhanced_candidates):
+#                     # Fetch full chunk data from vector_index.chunk_metadata
+#                     chunk_data = self.vector_index.chunk_metadata.get(chunk_id)
+#                     if chunk_data:
+#                         kg_chunk_candidates.append({
+#                             'chunk_id': chunk_id,
+#                             'similarity_score': item['distance_from_query_entity'] * -0.1 + 0.5, # Inverse distance as score, normalize
+#                             'content': chunk_data.get('content', ''),
+#                             'document_id': chunk_data.get('document_id', ''),
+#                             'keywords': chunk_data.get('keywords', []),
+#                             'entities': chunk_data.get('entities', [])
+#                         })
+#         enhanced_candidates.extend(kg_chunk_candidates)
+
+#         # 3. Apply Re-ranking (Cross-encoder or RRF)
+#         final_results = self._rank_results(enhanced_candidates, query_analysis, query)
+
+#         return final_results[:top_k]
+
+#     def _enhance_and_boost_candidates(self, candidates: List[Dict[str, Any]], query_analysis: Dict[str, Any], kg_related_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+#         """
+#         Enhance and boost scores of candidates based on KG relatedness and keyword overlap.
+#         """
+#         enhanced_results = []
+#         query_entities = [e.lower() for e in query_analysis.get('entities', [])]
+#         query_keywords = [kw.lower() for kw in query_analysis.get('keywords', [])]
+
+#         for result in candidates:
+#             enhanced_result = result.copy()
+#             initial_score = enhanced_result.get('similarity_score', 0)
+
+#             # --- Boost based on KG entity overlap ---
+#             doc_entities = [e.get('name', '').lower() for e in result.get('entities', [])]
+#             entity_overlap_count = len(set(query_entities) & set(doc_entities))
+#             if entity_overlap_count > 0:
+#                 initial_score *= (1 + entity_overlap_count * 0.3) # Stronger boost
+
+#             # --- Boost based on direct keyword matches ---
+#             content_lower = result.get('content', '').lower()
+#             doc_keywords = [kw.lower() for kw in result.get('keywords', [])]
+
+#             keyword_content_matches = sum(1 for kw in query_keywords if kw in content_lower)
+#             keyword_tag_matches = len(set(query_keywords) & set(doc_keywords))
+#             total_keyword_matches = keyword_content_matches + keyword_tag_matches
+
+#             if total_keyword_matches > 0:
+#                 initial_score *= (1 + total_keyword_matches * 0.1) # Moderate boost
+
+#             # --- Boost based on KG related chunks/entities (if a chunk itself is KG-related) ---
+#             # Check if this chunk or its associated entities are directly related in KG to query entities
+#             is_kg_related = False
+#             for kg_item in kg_related_info:
+#                 if kg_item['type'] == 'CHUNK' and kg_item['id'] == result['chunk_id']:
+#                     is_kg_related = True
+#                     break
+#                 elif kg_item['type'] != 'CHUNK' and kg_item['id'] in [e['id'] for e in result.get('entities', [])]:
+#                     is_kg_related = True
+#                     break
+
+#             if is_kg_related:
+#                 initial_score *= 1.2 # Small boost for KG relevance
+
+#             enhanced_result['similarity_score'] = initial_score
+#             enhanced_results.append(enhanced_result)
+
+#         return enhanced_results
+
+#     def _rank_results(self, results: List[Dict[str, Any]], query_analysis: Dict[str, Any], query_text: str) -> List[Dict[str, Any]]:
+#         """
+#         Final ranking of results, potentially using a cross-encoder for re-scoring.
+#         Applies diversity filtering.
+#         """
+#         # First sort by the enhanced similarity score
+#         results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+
+#         # Cross-Encoder Re-ranking (if available)
+#         if self.cross_encoder and len(results) > 1:
+#             # Prepare pairs: [(query, chunk_content), ...]
+#             sentence_pairs = [(query_text, r['content']) for r in results]
+#             try:
+#                 # Mock cross-encoder scores
+#                 # actual_scores = self.cross_encoder.predict(sentence_pairs)
+#                 actual_scores = np.random.rand(len(results)) * 0.5 + 0.5 # Mock scores between 0.5 and 1.0
+#                 for i, score in enumerate(actual_scores):
+#                     # Combine semantic score with cross-encoder score
+#                     results[i]['similarity_score'] = (results[i]['similarity_score'] + score) / 2
+#                 results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+#                 logger.info("Results re-ranked by cross-encoder.")
+#             except Exception as e:
+#                 logger.warning(f"Cross-encoder re-ranking failed: {e}. Falling back to similarity score.")
+
+#         # Apply diversity filter
+#         diverse_results = []
+#         seen_document_ids = set()
+
+#         for result in results:
+#             doc_id = result.get('document_id')
+#             if doc_id not in seen_document_ids:
+#                 diverse_results.append(result)
+#                 seen_document_ids.add(doc_id)
+#             elif len(diverse_results) < len(results) / 2: # Allow some redundancy if scores are high
+#                 # If document is already seen, only add if significantly better score,
+#                 # or if we still need more results to hit target k
+#                 if result.get('similarity_score', 0) > 0.8 * next((d['similarity_score'] for d in diverse_results if d['document_id'] == doc_id), 0):
+#                     diverse_results.append(result)
+
+#         # If after diversity, we still don't have enough, add top-scoring duplicates
+#         # This logic ensures we meet top_k if possible, even with some duplicates
+#         if len(diverse_results) < len(results) and len(diverse_results) < 5: # Arbitrary threshold for adding more
+#              for result in results:
+#                  if result not in diverse_results: # Use object identity (reference)
+#                      diverse_results.append(result)
+#                      if len(diverse_results) >= len(results): # Stop if we've added all available
+#                          break
+
+#         # Final sort after diversity for good measure (important for RRF type merging)
+#         diverse_results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+#         return diverse_results
+
+# # =============================================================================
+# # 7. RESPONSE GENERATOR
+# # =============================================================================
+
+# class ResponseGenerator:
+#     def __init__(self):
+#         self.client = OpenAI(
+#             api_key=os.getenv("OPENAI_API_KEY"),
+#         )
+#         self.llm_model = LLM_MODEL_NAME
+
+#     def generate_response(self, query: str, retrieved_chunks: List[Dict[str, Any]], query_analysis: Dict[str, Any]) -> Dict[str, Any]:
+#         """Generate response from retrieved information using an LLM."""
+
+#         if not retrieved_chunks:
+#             return {
+#                 'answer': "I couldn't find relevant information to answer your query.",
+#                 'confidence': 0.0,
+#                 'sources': []
+#             }
+
+#         # Prepare context for the LLM
+#         context_parts = []
+#         sources_for_output = []
+#         seen_source_documents = set() # To track unique documents for citations
+
+#         for i, chunk in enumerate(retrieved_chunks):
+#             # Include document ID in context for LLM to potentially cite
+#             context_parts.append(f"Source Document ID: {chunk['document_id']}\nChunk Content:\n{chunk['content']}\n---")
+
+#             # Prepare sources for the final output
+#             if chunk['document_id'] not in seen_source_documents:
+#                 sources_for_output.append({
+#                     'document_id': chunk.get('document_id', 'N/A'),
+#                     'score': chunk.get('similarity_score', 0),
+#                     'entities_in_chunk': [e.get('name', '') for e in chunk.get('entities', [])],
+#                     'keywords_in_chunk': chunk.get('keywords', [])
+#                 })
+#                 seen_source_documents.add(chunk['document_id'])
+
+#             # Limit context size for LLM API call if needed (token limits)
+#             # This is a rough estimation, actual token count would be better
+#             if len("\n\n".join(context_parts).split()) > 3000: # Example limit: ~3000 words
+#                 break
+
+#         full_context = "\n\n".join(context_parts)
+
+#         # Define the prompt for the LLM
+#         # Instruct the LLM to only use provided information and cite sources.
+#         prompt = f"""
+#                     You are an intelligent assistant designed to provide answers based *only* on the provided information.
+#                     Do not use any outside knowledge. If the answer cannot be found in the provided context, state that you cannot answer the question based on the given information.
+#                     For each statement in your answer, indicate which "Source Document ID" it came from.
+#                     If a piece of information is found in multiple sources, you may cite all relevant sources.
+
+#                     ---
+#                     Information:
+#                     {full_context}
+#                     ---
+
+#                     Question: {query}
+#                     """
+
+#         llm_answer = "An error occurred while generating the response."
+#         try:
+#             chat_completion = self.client.chat.completions.create(
+#                 model=self.llm_model,
+#                 messages=[
+#                     {"role": "system", "content": "You are a helpful assistant."},
+#                     {"role": "user", "content": prompt}
+#                 ],
+#                 temperature=0.0, # Make it less creative, more factual
+#                 max_tokens=1000 # Adjust based on expected answer length
+#             )
+#             llm_answer = chat_completion.choices[0].message.content.strip()
+#             logger.info("LLM response generated.")
+#         # except openai.APIError as e:
+#         #     logger.error(f"OpenAI API error: {e}")
+#         #     llm_answer = f"An error occurred with the OpenAI API: {e}. Please check your API key and network."
+#         except Exception as e:
+#             logger.error(f"Error calling LLM: {e}")
+#             llm_answer = f"An unexpected error occurred during response generation: {e}."
+
+#         # Calculate confidence - simple average of top chunk scores
+#         # More sophisticated confidence could involve LLM's own confidence or semantic similarity of answer to query
+#         avg_score = sum(chunk.get('similarity_score', 0) for chunk in retrieved_chunks) / len(retrieved_chunks)
+#         confidence = min(avg_score, 1.0) # Ensure it doesn't exceed 1.0
+
+#         return {
+#             'answer': llm_answer,
+#             'confidence': confidence,
+#             'sources': sources_for_output,
+#             'context_used_chunks_count': len(retrieved_chunks)
+#         }
+
+# # =============================================================================
+# # 8. PERSISTENCE MANAGER
+# # =============================================================================
+
+# class StorageManager:
+#     def __init__(self, data_path: Path, storage_path: Path):
+#         self.data_path = data_path
+#         self.storage_path = storage_path
+#         self.storage_path.mkdir(parents=True, exist_ok=True) # Ensure storage dir exists
+
+#     def _calculate_data_hash(self) -> str:
+#         """Calculates a hash of all files in the data directory."""
+#         hasher = hashlib.md5()
+#         file_paths = sorted(list(self.data_path.rglob('*'))) # Get all files, sorted for consistency
+#         for file_path in file_paths:
+#             if file_path.is_file():
+#                 with open(file_path, 'rb') as f:
+#                     # Read in chunks to handle large files
+#                     for chunk in iter(lambda: f.read(4096), b''):
+#                         hasher.update(chunk)
+#         return hasher.hexdigest()
+
+#     def _get_last_data_hash(self) -> Optional[str]:
+#         """Reads the last stored data hash."""
+#         if LAST_DATA_HASH_PATH.exists():
+#             return LAST_DATA_HASH_PATH.read_text().strip()
+#         return None
+
+#     def _save_data_hash(self, current_hash: str):
+#         """Saves the current data hash."""
+#         LAST_DATA_HASH_PATH.write_text(current_hash)
+
+#     def is_data_changed(self) -> bool:
+#         """Checks if the data directory has changed since last processing."""
+#         current_hash = self._calculate_data_hash()
+#         last_hash = self._get_last_data_hash()
+
+#         if current_hash != last_hash:
+#             logger.info("Data directory has changed or no previous hash found. Re-processing required.")
+#             return True
+#         logger.info("Data directory is unchanged. Loading pre-calculated data.")
+#         return False
+
+#     def save_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager):
+#         """Saves all relevant data structures."""
+#         vector_index_manager.save_index()
+#         kg_manager.save_graph()
+#         self._save_data_hash(self._calculate_data_hash())
+#         logger.info("All data structures and data hash saved.")
+
+#     def load_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager) -> bool:
+#         """Loads all relevant data structures. Returns True if successful, False otherwise."""
+#         vector_loaded = vector_index_manager.load_index()
+#         kg_loaded = kg_manager.load_graph()
+#         # For a successful load, both must be present. If either fails, force re-processing
+#         if vector_loaded and kg_loaded and LAST_DATA_HASH_PATH.exists():
+#             # Only consider "loaded" if data hash exists, implies previous full save
+#             logger.info("All data structures loaded successfully.")
+#             return True
+#         logger.warning("Incomplete or failed load of data structures. Will re-process data.")
+#         return False
+
+
+# # =============================================================================
+# # 9. MAIN RAG SYSTEM
+# # =============================================================================
+
+# class SimpleAdvancedRAGSystem:
+#     def __init__(self):
+#         self.storage_manager = StorageManager(DATA_PATH, STORAGE_PATH)
+#         self.doc_processor = DocumentProcessor()
+#         self.vector_index = VectorIndexManager()
+#         self.kg_manager = KnowledgeGraphManager()
+#         self.retrieval_engine = HybridRetrievalEngine(self.vector_index, self.kg_manager)
+#         self.response_generator = ResponseGenerator()
+
+#         logger.info("RAG System components initialized.")
+
+#     def initialize_knowledge_base(self):
+#         """Initializes or re-processes the knowledge base based on data changes."""
+#         if self.storage_manager.load_all(self.vector_index, self.kg_manager):
+#             # Data loaded, check if original data files have changed
+#             if not self.storage_manager.is_data_changed():
+#                 logger.info("Knowledge base is up-to-date. No re-processing needed.")
+#                 return
+
+#         logger.info("Re-processing documents due to data changes or no prior data found.")
+#         self._process_and_store_documents()
+#         self.storage_manager.save_all(self.vector_index, self.kg_manager)
+#         logger.info("Knowledge base re-processing complete and saved.")
+
+#     def _process_and_store_documents(self):
+#         """Processes documents from the DATA_PATH and stores them."""
+#         documents = self._load_documents_from_directory(DATA_PATH)
+
+#         if not documents:
+#             logger.warning(f"No documents found in {DATA_PATH}. Knowledge base will be empty.")
+#             return
+
+#         all_chunks = []
+#         all_entities = []
+#         all_relations = []
+
+#         for doc in documents:
+#             doc_id = doc['id']
+#             content = doc['content']
+
+#             # Process document
+#             chunks, entities, relations = self.doc_processor.process_document(doc_id, content)
+
+#             all_chunks.extend(chunks)
+#             all_entities.extend(entities)
+#             all_relations.extend(relations)
+
+#         self.vector_index.add_chunks(all_chunks)
+#         self.kg_manager.add_data(all_chunks, all_entities, all_relations) # Pass chunks to KG for chunk nodes
+
+#         logger.info(f"Processed {len(documents)} documents, Created {len(all_chunks)} chunks, {len(all_entities)} Entities, {len(all_relations)} Relations.")
+
+#     def _load_documents_from_directory(self, directory: Path) -> List[Dict[str, str]]:
+#         """Load documents from a specified directory."""
+#         documents = []
+#         for file_path in directory.iterdir():
+#             if file_path.is_file():
+#                 try:
+#                     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+#                         content = f.read()
+#                     documents.append({'id': file_path.name, 'content': content})
+#                     logger.info(f"Loaded document: {file_path.name}")
+#                 except Exception as e:
+#                     logger.error(f"Could not read {file_path}: {e}")
+#         return documents
+
+#     def query(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
+#         """Process a query and return results."""
+#         logger.info(f"Processing query: '{query_text}'")
+#         try:
+#             # Retrieve relevant chunks
+#             retrieved_chunks = self.retrieval_engine.retrieve(query_text, top_k)
+            
+#             # Analyze query for response generation (can reuse analysis from retrieval engine if desired)
+#             query_analysis = self.retrieval_engine.query_processor.analyze_query(query_text)
+            
+#             # Generate response
+#             response = self.response_generator.generate_response(
+#                 query_text, retrieved_chunks, query_analysis
+#             )
+            
+#             # Add metadata
+#             response['query_analysis'] = query_analysis
+#             response['timestamp'] = datetime.now().isoformat()
+#             response['status'] = 'success'
+            
+#             logger.info("Query processed successfully.")
+#             return response
+            
+#         except Exception as e:
+#             logger.exception(f"Error processing query: {e}") # Use exception to log traceback
+#             return {
+#                 'status': 'error',
+#                 'error': str(e),
+#                 'timestamp': datetime.now().isoformat()
+#             }
+
+#     def get_system_stats(self) -> Dict[str, Any]:
+#         """Get system statistics."""
+#         try:
+#             return {
+#                 'status': 'success',
+#                 'vector_index_size': self.vector_index.index.ntotal if self.vector_index.index else 0,
+#                 'knowledge_graph_nodes': self.kg_manager.graph.number_of_nodes(),
+#                 'knowledge_graph_edges': self.kg_manager.graph.number_of_edges(),
+#                 'total_entities': len(self.kg_manager.entities),
+#                 'total_relations': len(self.kg_manager.relations),
+#                 'total_chunks_in_kg': len(self.kg_manager.document_chunks),
+#                 'timestamp': datetime.now().isoformat()
+#             }
+#         except Exception as e:
+#             logger.error(f"Error getting system stats: {e}")
+#             return {
+#                 'status': 'error',
+#                 'error': str(e),
+#                 'timestamp': datetime.now().isoformat()
+#             }
+
+# # =============================================================================
+# # 10. USAGE EXAMPLE
+# # =============================================================================
+
+# if __name__ == "__main__":
+#     # Initialize RAG system
+#     rag_system = SimpleAdvancedRAGSystem()
+
+#     # Initialize the knowledge base (loads from disk or re-processes)
+#     rag_system.initialize_knowledge_base()
+#     print("\nKnowledge Base Ready!")
+
+#     print(f"System Stats: {rag_system.get_system_stats()}\n")
+
+#     print("Enter your query (type 'exit' to quit):")
+#     while True:
+#         try:
+#             user_input = input("Query> ").strip()
+#             if user_input.lower() in ("exit", "quit"):
+#                 print("Exiting interactive RAG system. Goodbye!")
+#                 break
+#             if not user_input:
+#                 continue
+
+#             query_result = rag_system.query(user_input)
+#             print("-" * 50)
+#             print(f"Answer: {query_result['answer']}")
+#             print(f"Confidence: {query_result['confidence']:.2f}")
+#             print(f"Sources Used:")
+#             for src in query_result['sources']:
+#                 print(f"  - Document: {src['document_id']} (Score: {src['score']:.2f})")
+#                 print(f"    Entities: {', '.join(src['entities_in_chunk']) if src['entities_in_chunk'] else 'None'}")
+#                 print(f"    Keywords: {', '.join(src['keywords_in_chunk']) if src['keywords_in_chunk'] else 'None'}")
+#             print(f"Query Analysis: {query_result['query_analysis']}")
+#             print("-" * 50 + "\n")
+#         except (KeyboardInterrupt, EOFError):
+#             print("\nExiting interactive RAG system. Goodbye!")
+#             break
+#         except Exception as e:
+#             logger.exception(f"An error occurred during interactive query loop: {e}")
+#             print(f"An unexpected error occurred: {e}")
+#             continue
+
+import asyncio
+import json
+import numpy as np
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from pathlib import Path
+import uuid
+import logging
+import re
+import os
+from dotenv import load_dotenv
+import sys
+import hashlib
+import tiktoken # Added for token counting
+
+# Core libraries
+import faiss
+import networkx as nx
+from sklearn.feature_extraction.text import TfidfVectorizer
+import spacy
+from spacy.matcher import Matcher, PhraseMatcher
+
+# OpenAI & Sentence Transformers
+from openai import OpenAI, APIError
+# from sentence_transformers import SentenceTransformer # Keep commented as it's not truly used
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# Configuration Constants (can be moved to a config file)
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-ada-002")
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-3.5-turbo")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536")) # Ada-002 dimension
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
+CHUNK_OVERLAP_SENTENCES = int(os.getenv("CHUNK_OVERLAP_SENTENCES", "2")) # Changed to sentences
+STORAGE_PATH = Path(os.getenv("STORAGE_PATH", "./storage"))
+DATA_PATH = Path(os.getenv("DATA_PATH", "./data"))
+LLM_MAX_TOKENS_CONTEXT = int(os.getenv("LLM_MAX_TOKENS_CONTEXT", "4000")) # Common for gpt-3.5-turbo (4k input)
+LLM_MAX_TOKENS_RESPONSE = int(os.getenv("LLM_MAX_TOKENS_RESPONSE", "1000"))
+
+
+# --- Persistence Paths ---
+FAISS_INDEX_PATH = STORAGE_PATH / "faiss_index.bin"
+CHUNK_METADATA_PATH = STORAGE_PATH / "chunk_metadata.json"
+ID_TO_INDEX_PATH = STORAGE_PATH / "id_to_index.json"
+INDEX_TO_ID_PATH = STORAGE_PATH / "index_to_id.json"
+KG_GRAPH_PATH = STORAGE_PATH / "kg_graph.gml" # GML for NetworkX graph
+KG_ENTITIES_PATH = STORAGE_PATH / "kg_entities.json"
+KG_RELATIONS_PATH = STORAGE_PATH / "kg_relations.json"
+LAST_DATA_HASH_PATH = STORAGE_PATH / "data_hash.txt"
+KG_CHUNKS_PATH = STORAGE_PATH / "kg_chunks.json" # Defined explicitly for clarity
+
+# Ensure storage and data directory exist
+STORAGE_PATH.mkdir(parents=True, exist_ok=True)
+DATA_PATH.mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
+# 1. DATA STRUCTURES
+# =============================================================================
+
+@dataclass
+class DocumentChunk:
+    id: str
+    document_id: str
+    content: str
+    chunk_index: int
+    embedding: Optional[np.ndarray] = None # Make optional for initial creation
+    keywords: List[str] = field(default_factory=list)
+    entities: List[Dict[str, Any]] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'document_id': self.document_id,
+            'content': self.content,
+            'chunk_index': self.chunk_index,
+            'embedding': self.embedding.tolist() if self.embedding is not None else None,
+            'keywords': self.keywords,
+            'entities': self.entities,
+            'metadata': self.metadata
+        }
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]):
+        return DocumentChunk(
+            id=data['id'],
+            document_id=data['document_id'],
+            content=data['content'],
+            chunk_index=data['chunk_index'],
+            embedding=np.array(data['embedding']).astype(np.float32) if data['embedding'] is not None else None,
+            keywords=data['keywords'],
+            entities=data['entities'],
+            metadata=data['metadata']
+        )
+
+@dataclass
+class KnowledgeEntity:
+    id: str
+    name: str
+    entity_type: str
+    confidence: float
+    document_ids: List[str] = field(default_factory=list)
+    related_chunks: List[str] = field(default_factory=list)
+
+    def to_dict(self):
+        return self.__dict__
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]):
+        return KnowledgeEntity(**data)
+
+@dataclass
+class KnowledgeRelation:
+    id: str
+    source_entity: str # ID of source entity
+    target_entity: str # ID of target entity
+    relation_type: str
+    confidence: float
+    document_id: Optional[str] = None # Document where relation was found
+    sentence: Optional[str] = None # Sentence from which relation was extracted
+
+    def to_dict(self):
+        return self.__dict__
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]):
+        return KnowledgeRelation(**data)
+
+# =============================================================================
+# 2. UTILITY SERVICES (Embedding, etc.)
+# =============================================================================
+
+class EmbeddingService:
+    """Service for generating text embeddings with retry logic."""
+    def __init__(self, api_key: str, model_name: str, embedding_dim: int):
+        self.client = OpenAI(api_key=api_key)
+        self.model_name = model_name
+        self.embedding_dim = embedding_dim
+
+    def get_embedding(self, text: str, retries: int = 3, delay: int = 1) -> np.ndarray:
+        """Generates embedding for a given text using OpenAI API with retry logic."""
+        for i in range(retries):
+            try:
+                response = self.client.embeddings.create(
+                    model=self.model_name,
+                    input=text
+                )
+                return np.array(response.data[0].embedding).astype(np.float32)
+            except APIError as e:
+                logger.warning(f"OpenAI API error during embedding (attempt {i+1}/{retries}): {e}")
+                if i < retries - 1:
+                    import time
+                    time.sleep(delay * (2 ** i)) # Exponential backoff
+                else:
+                    logger.error(f"Failed to get embedding after {retries} attempts for text: {text[:50]}...")
+                    return np.zeros(self.embedding_dim, dtype=np.float32)
+            except Exception as e:
+                logger.error(f"Unexpected error getting embedding for text: {text[:50]}... Error: {e}")
+                return np.zeros(self.embedding_dim, dtype=np.float32)
+        return np.zeros(self.embedding_dim, dtype=np.float32) # Should not be reached
+
+# =============================================================================
+# 3. DOCUMENT PROCESSOR
+# =============================================================================
+
+class DocumentProcessor:
+    def __init__(self, embedding_service: EmbeddingService):
+        self.embedding_service = embedding_service
+
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+            self.nlp.max_length = 2_000_000 # Increase max_length for larger documents
+            self.matcher = Matcher(self.nlp.vocab)
+            self.phrase_matcher = PhraseMatcher(self.nlp.vocab) # Initialize PhraseMatcher
+
+            # --- 1. Define Custom Hydrology Entity Types (Rule-Based) ---
+            # Hydrological Features (Water Bodies, Geological Features)
+            water_body_terms = [
+                "river", "lake", "stream", "aquifer", "reservoir", "ocean", "sea",
+                "wetland", "marsh", "swamp", "estuary", "fjord", "bay", "lagoon",
+                "groundwater", "surface water", "drinking water", "dam", "canal",
+                "watershed", "basin", "drainage basin", "catchment area", "glacier", "ice cap"
+            ]
+            self.phrase_matcher.add("WATER_BODY", [self.nlp(text) for text in water_body_terms])
+
+            # Hydrological Measurements/Parameters
+            measurement_terms = [
+                "flow rate", "water level", "stage height", "precipitation", "rainfall", "snowfall",
+                "temperature", "salinity", "pH", "dissolved oxygen", "turbidity", "conductivity",
+                "discharge", "volume", "depth", "velocity", "humidity", "evaporation", "transpiration"
+            ]
+            self.phrase_matcher.add("HYDRO_MEASUREMENT", [self.nlp(text) for text in measurement_terms])
+
+            # Pollutants/Chemicals (add common ones in hydrology)
+            pollutant_terms = [
+                "nitrate", "phosphate", "sulfate", "mercury", "lead", "cadmium", "arsenic",
+                "pesticide", "herbicide", "heavy metal", "microplastic", "E. coli",
+                "contaminant", "pollutant", "nutrient", "algae"
+            ]
+            self.phrase_matcher.add("POLLUTANT", [self.nlp(text) for text in pollutant_terms])
+
+            # Hydrological Events/Processes
+            event_terms = [
+                "flood", "drought", "storm", "hurricane", "typhoon", "cyclone",
+                "runoff", "infiltration", "percolation", "erosion", "sedimentation",
+                "desalination", "recharge", "effluent", "discharge event"
+            ]
+            self.phrase_matcher.add("HYDRO_EVENT", [self.nlp(text) for text in event_terms])
+
+            # Hydrological Infrastructure/Equipment
+            infrastructure_terms = [
+                "gauge", "sensor", "monitor", "weather station", "well", "pump",
+                "treatment plant", "wastewater facility", "dam", "levee", "dyke", "pipe", "culvert"
+            ]
+            self.phrase_matcher.add("HYDRO_INFRASTRUCTURE", [self.nlp(text) for text in infrastructure_terms])
+
+            # Hydrological Models/Software (e.g., specific software names)
+            model_terms = [
+                "SWMM", "HEC-RAS", "MODFLOW", "VIC model", "WRF-Hydro", "WEAP"
+            ]
+            self.phrase_matcher.add("HYDRO_MODEL", [self.nlp(text) for text in model_terms])
+
+            # Custom 'STUDY' entity types (for INVESTIGATES relation)
+            study_terms = [
+                "study", "research", "project", "analysis", "investigation", "report", "assessment"
+            ]
+            self.phrase_matcher.add("STUDY", [self.nlp(text) for text in study_terms])
+
+
+            # --- 2. Define Custom Hydrology Relation Patterns ---
+            # These patterns will connect the entities you define, and also spaCy's default entities (like GPE, ORG)
+
+            # WATER_BODY FLOWS_INTO WATER_BODY
+            self.matcher.add("FLOWS_INTO", [[
+                {"ENT_TYPE": {"IN": ["WATER_BODY", "GPE"]}},
+                {"LEMMA": {"IN": ["flow", "drain", "empty", "discharge"]}},
+                {"POS": "ADP", "OP": "*"},
+                {"ENT_TYPE": {"IN": ["WATER_BODY", "GPE"]}}
+            ]])
+
+            # HYDRO_INFRASTRUCTURE MEASURES HYDRO_MEASUREMENT/POLLUTANT
+            self.matcher.add("MEASURES", [[
+                {"ENT_TYPE": "HYDRO_INFRASTRUCTURE"},
+                {"LEMMA": {"IN": ["measure", "detect", "record", "monitor", "gauge"]}},
+                {"ENT_TYPE": {"IN": ["HYDRO_MEASUREMENT", "POLLUTANT"]}}
+            ]])
+
+            # WATER_BODY CONTAINS POLLUTANT
+            self.matcher.add("CONTAINS", [[
+                {"ENT_TYPE": "WATER_BODY"},
+                {"LEMMA": {"IN": ["contain", "have", "include", "exhibit"]}},
+                {"ENT_TYPE": "POLLUTANT"}
+            ]])
+
+            # HYDRO_EVENT CAUSES HYDRO_EVENT/IMPACT
+            self.matcher.add("CAUSES", [[
+                {"ENT_TYPE": "HYDRO_EVENT"},
+                {"LEMMA": "cause"},
+                {"ENT_TYPE": {"IN": ["HYDRO_EVENT", "HYDRO_MEASUREMENT"]}} # e.g., flood causes high water level
+            ]])
+
+            # ORG/PERSON USES HYDRO_MODEL
+            self.matcher.add("USES_MODEL", [[
+                {"ENT_TYPE": {"IN": ["ORG", "PERSON"]}},
+                {"LEMMA": {"IN": ["use", "apply", "employ", "utilize", "develop"]}},
+                {"ENT_TYPE": "HYDRO_MODEL"}
+            ]])
+
+            # STUDY INVESTIGATES WATER_BODY/HYDRO_EVENT/POLLUTANT
+            self.matcher.add("INVESTIGATES", [[
+                {"ENT_TYPE": "STUDY"}, # Now directly using the custom 'STUDY' entity
+                {"LEMMA": {"IN": ["investigate", "analyze", "examine", "assess"]}},
+                {"ENT_TYPE": {"IN": ["WATER_BODY", "HYDRO_EVENT", "POLLUTANT", "HYDRO_MEASUREMENT"]}}
+            ]])
+
+        except OSError:
+            logger.error("spaCy model 'en_core_web_sm' not found. Please install with: python -m spacy download en_core_web_sm")
+            self.nlp = None
+            self.matcher = None
+            self.phrase_matcher = None # Ensure phrase_matcher is also None if nlp fails
+
+        self.chunk_size = CHUNK_SIZE
+        self.chunk_overlap_sentences = CHUNK_OVERLAP_SENTENCES
+        self.tfidf = TfidfVectorizer(max_features=100, stop_words='english')
+
+    def process_document(self, document_id: str, content: str) -> Tuple[List[DocumentChunk], List[KnowledgeEntity], List[KnowledgeRelation]]:
+        """Process document into chunks with entities and relations"""
+        logger.info(f"Processing document: {document_id}")
+        cleaned_content = self._clean_text(content)
+
+        # Extract entities first
+        entities = self._extract_entities(cleaned_content, document_id)
+
+        # Create chunks
+        chunks = self._create_chunks(cleaned_content, document_id)
+
+        # Generate embeddings
+        for chunk in chunks:
+            chunk.embedding = self.embedding_service.get_embedding(chunk.content) # Use centralized service
+
+        # Extract keywords
+        self._extract_keywords(chunks)
+
+        # Link entities to chunks
+        self._link_entities_to_chunks(chunks, entities)
+
+        # Create relations
+        relations = self._create_relations(entities, cleaned_content, document_id) # Pass content for contextual relation extraction
+
+        return chunks, entities, relations
+
+    def _clean_text(self, content: str) -> str:
+        content = re.sub(r'\s+', ' ', content)
+        return content.strip()
+
+    def _create_chunks(self, content: str, doc_id: str) -> List[DocumentChunk]:
+        """Create overlapping chunks based on sentences."""
+        if self.nlp:
+            doc = self.nlp(content)
+            sentences = [sent.text for sent in doc.sents]
+        else:
+            sentences = content.split('. ') # Fallback if spaCy not loaded, split by ". "
+            sentences = [s.strip() for s in sentences if s.strip()] # Clean up empty strings
+
+        chunks = []
+        current_chunk_sentences = []
+        current_chunk_len_words = 0
+        chunk_index = 0
+
+        for i, sent in enumerate(sentences):
+            sent_word_count = len(sent.split())
+
+            if current_chunk_len_words + sent_word_count <= self.chunk_size:
+                current_chunk_sentences.append(sent)
+                current_chunk_len_words += sent_word_count
+            else:
+                if current_chunk_sentences: # Save current chunk if not empty
+                    chunk_content = " ".join(current_chunk_sentences)
+                    chunk = DocumentChunk(
+                        id=str(uuid.uuid4()),
+                        document_id=doc_id,
+                        content=chunk_content,
+                        chunk_index=chunk_index
+                    )
+                    chunks.append(chunk)
+                    chunk_index += 1
+
+                # Start new chunk with a fixed number of overlapping sentences
+                # Ensure we don't try to get more sentences than available
+                start_overlap_idx = max(0, len(current_chunk_sentences) - self.chunk_overlap_sentences)
+                overlap_sentences = current_chunk_sentences[start_overlap_idx:]
+                
+                current_chunk_sentences = overlap_sentences + [sent]
+                current_chunk_len_words = len(" ".join(current_chunk_sentences).split())
+
+        if current_chunk_sentences: # Add the last chunk
+            chunk_content = " ".join(current_chunk_sentences)
+            chunk = DocumentChunk(
+                id=str(uuid.uuid4()),
+                document_id=doc_id,
+                content=chunk_content,
+                chunk_index=chunk_index
+            )
+            chunks.append(chunk)
+
+        return chunks
+
+    def _extract_entities(self, content: str, doc_id: str) -> List[KnowledgeEntity]:
+        """Extract named entities using spaCy NER and custom PhraseMatcher rules."""
+        entities = []
+        if not self.nlp:
+            return entities
+
+        doc = self.nlp(content)
+        seen_entities = set() # To avoid duplicate entities with same name and type
+
+        # 1. Add entities found by spaCy's default NER
+        for ent in doc.ents:
+            if len(ent.text.strip()) < 2 or ent.text.strip().isnumeric():
+                continue
+            entity_key = (ent.text.lower(), ent.label_)
+            if entity_key not in seen_entities:
+                entity = KnowledgeEntity(
+                    id=str(uuid.uuid4()),
+                    name=ent.text,
+                    entity_type=ent.label_,
+                    confidence=0.9,
+                    document_ids=[doc_id]
+                )
+                entities.append(entity)
+                seen_entities.add(entity_key)
+        
+        # 2. Add entities found by custom PhraseMatcher rules
+        if self.phrase_matcher: # Check if phrase_matcher was initialized successfully
+            matches = self.phrase_matcher(doc)
+            for match_id, start, end in matches:
+                span = doc[start:end]
+                # The entity type for PhraseMatcher comes from the `match_id` (rule name)
+                custom_entity_type = self.nlp.vocab.strings[match_id] 
+                
+                if len(span.text.strip()) < 2 or span.text.strip().isnumeric():
+                    continue
+                
+                # Check if this custom entity (text + type) has already been seen (from NER or another custom rule)
+                entity_key = (span.text.lower(), custom_entity_type)
+                if entity_key not in seen_entities:
+                    entity = KnowledgeEntity(
+                        id=str(uuid.uuid4()),
+                        name=span.text,
+                        entity_type=custom_entity_type,
+                        confidence=0.95, # Higher confidence for direct phrase matches
+                        document_ids=[doc_id]
+                    )
+                    entities.append(entity)
+                    seen_entities.add(entity_key)
+
+        return entities
+
+    def _extract_keywords(self, chunks: List[DocumentChunk]):
+        """Extract keywords using TF-IDF"""
+        if not chunks:
+            return
+
+        try:
+            texts = [chunk.content for chunk in chunks]
+            # Filter out empty strings from texts before fitting TF-IDF
+            non_empty_texts = [t for t in texts if t.strip()]
+
+            if not non_empty_texts:
+                logger.warning("No content in chunks for TF-IDF keyword extraction.")
+                for chunk in chunks: # Ensure keywords are empty if no content
+                    chunk.keywords = []
+                return
+
+            self.tfidf.fit(non_empty_texts) # Fit only on non-empty texts
+            feature_names = self.tfidf.get_feature_names_out()
+
+            for i, chunk in enumerate(chunks):
+                if chunk.content.strip():
+                    tfidf_matrix = self.tfidf.transform([chunk.content])
+                    scores = tfidf_matrix.toarray()[0]
+                    # Select top 5 keywords with score > 0
+                    top_indices = scores.argsort()[-5:][::-1]
+                    chunk.keywords = [feature_names[idx] for idx in top_indices if scores[idx] > 0]
+                else:
+                    chunk.keywords = []
+        except Exception as e:
+            logger.error(f"Error during TF-IDF keyword extraction: {e}")
+            for chunk in chunks:
+                chunk.keywords = []
+
+    def _link_entities_to_chunks(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity]):
+        """Link entities to chunks where they appear and add chunk IDs to entity.related_chunks."""
+        entity_name_to_id = {ent.name.lower(): ent.id for ent in entities}
+
+        for chunk in chunks:
+            for ent_name_lower, ent_id in entity_name_to_id.items():
+                # Check for entity name (case-insensitive) in chunk content
+                if ent_name_lower in chunk.content.lower():
+                    # Find the actual entity object by ID to update its related_chunks
+                    original_entity = next((e for e in entities if e.id == ent_id), None)
+                    if original_entity:
+                        # Ensure no duplicate entries
+                        if chunk.id not in original_entity.related_chunks:
+                            original_entity.related_chunks.append(chunk.id)
+                        # Add entity metadata to chunk
+                        if not any(e['id'] == ent_id for e in chunk.entities):
+                            chunk.entities.append({
+                                'id': original_entity.id,
+                                'name': original_entity.name,
+                                'type': original_entity.entity_type
+                            })
+
+    def _create_relations(self, entities: List[KnowledgeEntity], full_content: str, doc_id: str) -> List[KnowledgeRelation]:
+        """
+        Create relations using spaCy's dependency parser and rule-based patterns.
+        Falls back to co-occurrence if patterns don't match.
+        """
+        relations = []
+        if not self.nlp or not self.matcher:
+            return relations
+
+        doc = self.nlp(full_content)
+        entity_map = {ent.name: ent for ent in entities} # Map name to entity object
+
+        # Rule-based extraction using spaCy Matcher
+        matches = self.matcher(doc)
+        for match_id, start, end in matches:
+            span = doc[start:end]
+            rule_name = self.nlp.vocab.strings[match_id]
+
+            # Collect actual entities that are part of the original `entities` list
+            # and appear within the matched span
+            span_entities_in_kg = []
+            for ent_in_span in span.ents:
+                # Need to use entity_map to link span.ent.text back to original KnowledgeEntity objects
+                if ent_in_span.text in entity_map:
+                    span_entities_in_kg.append(entity_map[ent_in_span.text])
+
+            # Ensure we have at least two identified entities from our `entities` list
+            if len(span_entities_in_kg) >= 2:
+                # For simplicity, take the first two recognized entities in the span
+                source_ent = span_entities_in_kg[0]
+                target_ent = span_entities_in_kg[1]
+
+                if source_ent.id != target_ent.id: # Avoid self-loops
+
+                    relation_type = rule_name # Start with the rule name itself
+
+                    # Refine relation_type based on specific entity types involved
+                    if rule_name == "FLOWS_INTO" and (source_ent.entity_type in ["WATER_BODY", "GPE"]) and \
+                        (target_ent.entity_type in ["WATER_BODY", "GPE"]):
+                        relation_type = "FLOWS_INTO"
+                    elif rule_name == "MEASURES" and source_ent.entity_type == "HYDRO_INFRASTRUCTURE" and \
+                        target_ent.entity_type in ["HYDRO_MEASUREMENT", "POLLUTANT"]:
+                        relation_type = "MEASURES"
+                    elif rule_name == "CONTAINS" and source_ent.entity_type == "WATER_BODY" and \
+                        target_ent.entity_type == "POLLUTANT":
+                        relation_type = "CONTAINS"
+                    elif rule_name == "CAUSES" and source_ent.entity_type == "HYDRO_EVENT" and \
+                        target_ent.entity_type in ["HYDRO_EVENT", "HYDRO_MEASUREMENT"]:
+                        relation_type = "CAUSES"
+                    elif rule_name == "USES_MODEL" and source_ent.entity_type in ["ORG", "PERSON"] and \
+                        target_ent.entity_type == "HYDRO_MODEL":
+                        relation_type = "USES_MODEL"
+                    elif rule_name == "INVESTIGATES" and source_ent.entity_type == "STUDY" and \
+                        target_ent.entity_type in ["WATER_BODY", "HYDRO_EVENT", "POLLUTANT", "HYDRO_MEASUREMENT"]:
+                        relation_type = "INVESTIGATES"
+                    # Else, use the rule_name as the relation_type (e.g., "RELATED_TO_VIA_RULE")
+
+                    relations.append(KnowledgeRelation(
+                        id=str(uuid.uuid4()),
+                        source_entity=source_ent.id,
+                        target_entity=target_ent.id,
+                        relation_type=relation_type,
+                        confidence=0.9, # High confidence for rule matches
+                        document_id=doc_id,
+                        sentence=span.text # The sentence segment where the relation was found
+                    ))
+
+        # Fallback to co-occurrence for entities in the same sentence if no specific rule applied
+        # This is less precise but captures broader relationships.
+        extracted_relations_set = set([(r.source_entity, r.target_entity, r.relation_type) for r in relations])
+
+        for sent in doc.sents:
+            sent_entities = []
+            # Gather entities from the sentence that exist in our main `entity_map`
+            for ent_in_sent in sent.ents:
+                if ent_in_sent.text in entity_map:
+                    sent_entities.append(entity_map[ent_in_sent.text])
+            
+            # Also consider custom entities found by phrase_matcher within the sentence
+            if self.phrase_matcher:
+                phrase_matches_in_sent = self.phrase_matcher(sent)
+                for match_id, start, end in phrase_matches_in_sent:
+                    span_in_sent = sent.char_span(start, end)
+                    if span_in_sent and span_in_sent.text in entity_map: # Check if this phrase is also a known entity
+                        if entity_map[span_in_sent.text] not in sent_entities: # Avoid adding duplicates
+                            sent_entities.append(entity_map[span_in_sent.text])
+
+            if len(sent_entities) >= 2:
+                for i, ent1 in enumerate(sent_entities):
+                    for j, ent2 in enumerate(sent_entities):
+                        if i < j: # Avoid self-loops and duplicate (A,B) and (B,A) pairs
+                            # Check if a specific or CO_OCCURS relation already exists for this pair
+                            # Order is important for the set, so check both directions for undirected co-occurrence concept
+                            if (ent1.id, ent2.id, 'CO_OCCURS') not in extracted_relations_set and \
+                               (ent2.id, ent1.id, 'CO_OCCURS') not in extracted_relations_set:
+                                
+                                # Check if a more specific relation already exists between these two entities
+                                specific_relation_exists = False
+                                for r_check in extracted_relations_set:
+                                    if (r_check[0] == ent1.id and r_check[1] == ent2.id) or \
+                                       (r_check[0] == ent2.id and r_check[1] == ent1.id):
+                                        specific_relation_exists = True
+                                        break
+                                
+                                if not specific_relation_exists:
+                                    relation = KnowledgeRelation(
+                                        id=str(uuid.uuid4()),
+                                        source_entity=ent1.id,
+                                        target_entity=ent2.id,
+                                        relation_type='CO_OCCURS',
+                                        confidence=0.5, # Lower confidence for co-occurrence
+                                        document_id=doc_id,
+                                        sentence=sent.text
+                                    )
+                                    relations.append(relation)
+                                    extracted_relations_set.add((relation.source_entity, relation.target_entity, relation.relation_type))
+        return relations
+
+
+# =============================================================================
+# 4. VECTOR INDEX MANAGER
+# =============================================================================
+
+class VectorIndexManager:
+    def __init__(self, embedding_dim: int = EMBEDDING_DIM):
+        self.embedding_dim = embedding_dim
+        self.index: Optional[faiss.IndexFlatIP] = None # Initialize as None
+        self.chunk_metadata: Dict[str, Any] = {} # Stores serialized chunk data
+        self.id_to_index: Dict[str, int] = {}
+        self.index_to_id: Dict[int, str] = {}
+        self.current_index = 0
+        self._initialize_index()
+
+    def _initialize_index(self):
+        self.index = faiss.IndexFlatIP(self.embedding_dim)
+
+    def add_chunks(self, chunks: List[DocumentChunk]):
+        """Add chunks to vector index"""
+        if not chunks:
+            return
+        
+        embeddings_to_add = []
+        for chunk in chunks:
+            if chunk.embedding is not None and chunk.id not in self.id_to_index: # Only add new chunks
+                embeddings_to_add.append(chunk.embedding)
+                
+                # Store metadata
+                self.chunk_metadata[chunk.id] = chunk.to_dict() # Use to_dict for serialization
+                
+                # Store mappings
+                self.id_to_index[chunk.id] = self.current_index
+                self.index_to_id[self.current_index] = chunk.id
+                self.current_index += 1
+            elif chunk.id in self.id_to_index:
+                # Update existing chunk metadata if content might have changed (though in this flow, it's new docs)
+                # Note: If embeddings change for an existing chunk, you'd need to remove and re-add from FAISS
+                self.chunk_metadata[chunk.id] = chunk.to_dict()
+
+        if embeddings_to_add:
+            embeddings_array = np.array(embeddings_to_add).astype('float32')
+            self.index.add(embeddings_array)
+            logger.info(f"Added {len(embeddings_to_add)} new embeddings to FAISS index. Total: {self.index.ntotal}")
+
+    def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
+        """Search for similar chunks"""
+        if self.index.ntotal == 0:
+            logger.warning("FAISS index is empty. No search results.")
+            return []
+        
+        query_embedding = np.array([query_embedding]).astype('float32')
+        distances, indices = self.index.search(query_embedding, min(k, self.index.ntotal))
+        
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx in self.index_to_id:
+                chunk_id = self.index_to_id[idx]
+                chunk_dict = self.chunk_metadata.get(chunk_id, {})
+                
+                if chunk_dict:
+                    # For search results, dict is fine to avoid unnecessary object creation
+                    result_item = {
+                        'chunk_id': chunk_id,
+                        'similarity_score': float(dist),
+                        'content': chunk_dict.get('content', ''),
+                        'document_id': chunk_dict.get('document_id', ''),
+                        'keywords': chunk_dict.get('keywords', []),
+                        'entities': chunk_dict.get('entities', [])
+                    }
+                    results.append(result_item)
+                else:
+                    logger.warning(f"Index {idx} not found in chunk_metadata for chunk_id {chunk_id}. Data inconsistency.")
+            else:
+                logger.warning(f"Index {idx} not found in index_to_id mapping. Data inconsistency.")
+        
+        return results
+
+    def save_index(self):
+        """Saves the FAISS index and associated metadata."""
+        try:
+            faiss.write_index(self.index, str(FAISS_INDEX_PATH))
+            with open(CHUNK_METADATA_PATH, 'w', encoding='utf-8') as f:
+                json.dump({cid: data for cid, data in self.chunk_metadata.items()}, f, indent=2)
+            with open(ID_TO_INDEX_PATH, 'w', encoding='utf-8') as f:
+                json.dump(self.id_to_index, f, indent=2)
+            with open(INDEX_TO_ID_PATH, 'w', encoding='utf-8') as f:
+                # Convert int keys to str for JSON serialization
+                json.dump({str(k): v for k, v in self.index_to_id.items()}, f, indent=2)
+            logger.info("FAISS index and metadata saved.")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving FAISS index: {e}")
+            return False
+
+    def load_index(self):
+        """Loads the FAISS index and associated metadata."""
+        if (FAISS_INDEX_PATH.exists() and CHUNK_METADATA_PATH.exists() and
+            ID_TO_INDEX_PATH.exists() and INDEX_TO_ID_PATH.exists()):
+            try:
+                self.index = faiss.read_index(str(FAISS_INDEX_PATH))
+                with open(CHUNK_METADATA_PATH, 'r', encoding='utf-8') as f:
+                    self.chunk_metadata = json.load(f)
+                with open(ID_TO_INDEX_PATH, 'r', encoding='utf-8') as f:
+                    self.id_to_index = json.load(f)
+                with open(INDEX_TO_ID_PATH, 'r', encoding='utf-8') as f:
+                    # Convert str keys back to int
+                    self.index_to_id = {int(k): v for k, v in json.load(f).items()}
+                
+                self.current_index = self.index.ntotal
+                logger.info(f"FAISS index and metadata loaded. Total items: {self.index.ntotal}")
+                return True
+            except Exception as e:
+                logger.error(f"Error loading FAISS index, restarting from scratch: {e}")
+                self._initialize_index() # Re-initialize if load fails
+                return False
+        logger.info("No existing FAISS index found. Starting fresh.")
+        return False
+
+# =============================================================================
+# 5. KNOWLEDGE GRAPH MANAGER
+# =============================================================================
+
+class KnowledgeGraphManager:
+    def __init__(self):
+        self.graph = nx.DiGraph() # Directed graph for relations
+        self.entities: Dict[str, KnowledgeEntity] = {}
+        self.relations: Dict[str, KnowledgeRelation] = {}
+        self.document_chunks: Dict[str, DocumentChunk] = {} # Store chunk objects for KG nodes (metadata only)
+
+    def add_data(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity], relations: List[KnowledgeRelation]):
+        """Add entities, relations, and chunks to the graph."""
+        # Add chunks as nodes first
+        for chunk in chunks:
+            if chunk.id not in self.document_chunks:
+                self.document_chunks[chunk.id] = chunk
+                self.graph.add_node(chunk.id, type='CHUNK', content=chunk.content[:200] + '...') # Store snippet
+            # Update existing chunk's content snippet if it was added as a node earlier
+            else:
+                self.graph.nodes[chunk.id]['content'] = chunk.content[:200] + '...'
+
+
+        # Add entities
+        for entity in entities:
+            if entity.id not in self.entities:
+                self.entities[entity.id] = entity
+                # Only add if node not already present (could be a chunk ID too if ID collision, though unlikely)
+                if entity.id not in self.graph:
+                    self.graph.add_node(entity.id, name=entity.name, type=entity.entity_type)
+            else:
+                # Update existing entity's document and chunk lists if it's new data
+                existing_entity = self.entities[entity.id]
+                existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
+                existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
+                self.graph.nodes[entity.id]['name'] = entity.name # Ensure name is updated if needed
+
+            # Add MENTIONS relations between chunks and entities
+            for chunk_id in entity.related_chunks:
+                if chunk_id in self.graph and entity.id in self.graph:
+                    # Check if edge already exists to avoid duplicates
+                    if not self.graph.has_edge(chunk_id, entity.id):
+                        self.graph.add_edge(chunk_id, entity.id, relation_type='MENTIONS', confidence=1.0)
+                    if not self.graph.has_edge(entity.id, chunk_id): # Bi-directional for easier traversal
+                        self.graph.add_edge(entity.id, chunk_id, relation_type='MENTIONED_IN', confidence=1.0)
+
+
+        # Add relations (between entities)
+        for relation in relations:
+            # Only add if both source and target entities exist in the graph
+            if relation.source_entity in self.graph and relation.target_entity in self.graph:
+                if relation.id not in self.relations: # Only add new relations
+                    self.relations[relation.id] = relation
+                    # Check if edge already exists with same type to avoid duplicates for directed graph
+                    if not self.graph.has_edge(relation.source_entity, relation.target_entity, key=relation.relation_type):
+                        self.graph.add_edge(
+                            relation.source_entity,
+                            relation.target_entity,
+                            relation_type=relation.relation_type,
+                            confidence=relation.confidence,
+                            document_id=relation.document_id,
+                            sentence=relation.sentence
+                        )
+            else:
+                logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph. One might be a chunk.")
+        logger.info(f"Added {len(entities)} entities, {len(relations)} relations, and {len(chunks)} chunks to KG. Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}")
+
+    def get_related_info(self, query_entities: List[str], max_distance: int = 2) -> List[Dict[str, Any]]:
+        """
+        Get entities and related chunks connected to the given query entities,
+        traversing the knowledge graph.
+        """
+        related_info = []
+        seen_nodes = set()
+
+        # Find entity IDs from query names
+        query_entity_ids = []
+        for q_ent_name in query_entities:
+            for eid, entity_obj in self.entities.items():
+                if entity_obj.name.lower() == q_ent_name.lower():
+                    query_entity_ids.append(eid)
+                    break
+
+        if not query_entity_ids:
+            return []
+
+        for start_node_id in query_entity_ids:
+            if start_node_id not in self.graph:
+                continue
+
+            # BFS to find nodes within max_distance
+            # Use nx.shortest_path.shortest_path_length to get distance without recomputing path
+            for target_node in nx.bfs_tree(self.graph, start_node_id, depth_limit=max_distance).nodes():
+                if target_node == start_node_id: # Skip the start node itself for related info
+                    continue
+
+                if target_node not in seen_nodes:
+                    node_data = self.graph.nodes[target_node]
+                    
+                    # Calculate distance using shortest_path_length for accuracy from start_node_id
+                    try:
+                        distance = nx.shortest_path_length(self.graph, source=start_node_id, target=target_node)
+                    except nx.NetworkXNoPath:
+                        continue # Should not happen with bfs_tree, but as a safeguard
+
+                    info_item = {
+                        'id': target_node,
+                        'type': node_data.get('type'),
+                        'distance_from_query_entity': distance
+                    }
+
+                    if node_data.get('type') == 'CHUNK':
+                        chunk_obj = self.document_chunks.get(target_node)
+                        if chunk_obj:
+                            info_item['content_snippet'] = chunk_obj.content[:200] + "..."
+                            info_item['document_id'] = chunk_obj.document_id
+                        else:
+                            info_item['content_snippet'] = node_data.get('content', '') # Fallback to snippet stored in graph
+                            info_item['document_id'] = "UNKNOWN"
+                    elif node_data.get('type') in ['PERSON', 'ORG', 'GPE', 'NORP', 'FAC', 'LOCATION', 'PRODUCT', 'EVENT', 'WORK_OF_ART', 'LAW', 'LANGUAGE', 'DATE', 'TIME', 'PERCENT', 'MONEY', 'QUANTITY', 'ORDINAL', 'CARDINAL', 'STUDY', 'WATER_BODY', 'HYDRO_MEASUREMENT', 'POLLUTANT', 'HYDRO_EVENT', 'HYDRO_INFRASTRUCTURE', 'HYDRO_MODEL']:
+                        info_item['name'] = node_data.get('name')
+                        # Find the connecting edge data if there's a direct edge from source to target
+                        if self.graph.has_edge(start_node_id, target_node):
+                            connecting_edge_data = self.graph.get_edge_data(start_node_id, target_node)
+                            if connecting_edge_data: # Could have multiple edges, just take one
+                                first_edge_key = list(connecting_edge_data.keys())[0] # Get first edge key if multi-edge
+                                edge_attrs = connecting_edge_data[first_edge_key] if isinstance(connecting_edge_data, dict) else connecting_edge_data
+                                info_item['connection_type'] = edge_attrs.get('relation_type', 'unknown')
+                                info_item['connection_confidence'] = edge_attrs.get('confidence', 0.0)
+                    else: # Handle other potential spaCy entity types dynamically
+                        info_item['name'] = node_data.get('name', 'N/A')
+
+                    related_info.append(info_item)
+                    seen_nodes.add(target_node)
+
+        return related_info
+
+    def save_graph(self) -> bool:
+        """Saves the NetworkX graph and associated entity/relation data."""
+        try:
+            nx.write_gml(self.graph, str(KG_GRAPH_PATH)) # GML is a good format for NetworkX
+
+            with open(KG_ENTITIES_PATH, 'w', encoding='utf-8') as f:
+                json.dump({eid: entity.to_dict() for eid, entity in self.entities.items()}, f, indent=2)
+            with open(KG_RELATIONS_PATH, 'w', encoding='utf-8') as f:
+                json.dump({rid: relation.to_dict() for rid, relation in self.relations.items()}, f, indent=2)
+
+            # Save document chunks (metadata only, no embeddings)
+            chunks_to_save = {cid: chunk.to_dict() for cid, chunk in self.document_chunks.items()}
+            for cid in chunks_to_save:
+                if 'embedding' in chunks_to_save[cid]:
+                    chunks_to_save[cid]['embedding'] = None # Don't save embeddings here
+            with open(KG_CHUNKS_PATH, 'w', encoding='utf-8') as f:
+                json.dump(chunks_to_save, f, indent=2)
+
+            logger.info("Knowledge Graph and associated data saved.")
+            return True
+        except Exception as e:
+            logger.error(f"Error saving Knowledge Graph: {e}")
+            return False
+
+    def load_graph(self) -> bool:
+        """Loads the NetworkX graph and associated entity/relation data."""
+        if (KG_GRAPH_PATH.exists() and KG_ENTITIES_PATH.exists() and
+            KG_RELATIONS_PATH.exists() and KG_CHUNKS_PATH.exists()):
+            try:
+                self.graph = nx.read_gml(str(KG_GRAPH_PATH))
+
+                with open(KG_ENTITIES_PATH, 'r', encoding='utf-8') as f:
+                    self.entities = {eid: KnowledgeEntity.from_dict(data) for eid, data in json.load(f).items()}
+                with open(KG_RELATIONS_PATH, 'r', encoding='utf-8') as f:
+                    self.relations = {rid: KnowledgeRelation.from_dict(data) for rid, data in json.load(f).items()}
+                with open(KG_CHUNKS_PATH, 'r', encoding='utf-8') as f:
+                    self.document_chunks = {cid: DocumentChunk.from_dict(data) for cid, data in json.load(f).items()}
+
+                logger.info(f"Knowledge Graph loaded. Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}")
+                return True
+            except Exception as e:
+                logger.error(f"Error loading Knowledge Graph, restarting from scratch: {e}")
+                self.graph = nx.DiGraph() # Re-initialize if load fails
+                return False
+        logger.info("No existing Knowledge Graph found. Starting fresh.")
+        return False
+
+# =============================================================================
+# 6. QUERY PROCESSOR
+# =============================================================================
+
+class QueryProcessor:
+    def __init__(self):
+        try:
+            self.nlp = spacy.load("en_core_web_sm")
+        except OSError:
+            logger.error("spaCy model 'en_core_web_sm' not found for QueryProcessor. Install with: python -m spacy download en_core_web_sm")
+            self.nlp = None
+
+        self.query_types = {
+            'factual': ['what', 'who', 'when', 'where', 'which', 'how many'],
+            'explanatory': ['how', 'why', 'explain', 'describe', 'tell me about'],
+            'comparative': ['compare', 'versus', 'difference', 'similarities'],
+            'procedural': ['steps', 'process', 'procedure', 'how to'],
+            'definition': ['what is', 'define']
+        }
+        self.stop_words = self.nlp.Defaults.stop_words if self.nlp else set()
+
+
+    def analyze_query(self, query: str) -> Dict[str, Any]:
+        """Analyze query to understand intent and extract entities/keywords."""
+        query_lower = query.lower()
+        doc = self.nlp(query) if self.nlp else None
+
+        # Classify query type
+        query_type = 'general'
+        for qtype, indicators in self.query_types.items():
+            if any(indicator in query_lower for indicator in indicators):
+                query_type = qtype
+                break
+
+        # Extract keywords (more robust with spaCy)
+        keywords = []
+        if doc:
+            keywords = [token.lemma_ for token in doc if token.is_alpha and not token.is_stop and not token.is_punct and len(token.lemma_) > 2]
+            keywords = list(set(keywords)) # Remove duplicates
+
+        # Extract entities using spaCy's NER
+        entities = []
+        if doc:
+            for ent in doc.ents:
+                entities.append({'text': ent.text, 'label': ent.label_})
+
+        # Conceptual Entity Resolution/Linking (Placeholder)
+        # For now, we'll just use the extracted text.
+        # Include custom entity types in the extracted list as well if they are relevant for KG search
+        extracted_entity_names = [e['text'] for e in entities if e['label'] in ['PERSON', 'ORG', 'GPE', 'NORP', 'FAC', 'STUDY', 'WATER_BODY', 'HYDRO_MEASUREMENT', 'POLLUTANT', 'HYDRO_EVENT', 'HYDRO_INFRASTRUCTURE', 'HYDRO_MODEL']]
+
+        return {
+            'original_query': query,
+            'query_type': query_type,
+            'keywords': keywords,
+            'entities': extracted_entity_names,
+            'complexity': 'simple' if len(query.split()) < 5 else 'medium' if len(query.split()) < 15 else 'complex'
+        }
+
+    def _resolve_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Placeholder for entity resolution/linking.
+        This would typically involve calling an external service or a more complex model
+        to link entities to canonical IDs (e.g., Wikidata, DBpedia).
+        """
+        resolved = []
+        for ent in entities:
+            # Mock resolution: just return original for now
+            resolved_ent = ent.copy()
+            resolved_ent['canonical_id'] = None # Or some mock ID
+            resolved.append(resolved_ent)
+        return resolved
+
+# =============================================================================
+# 7. HYBRID RETRIEVAL ENGINE
+# =============================================================================
+
+class HybridRetrievalEngine:
+    def __init__(self, vector_index: VectorIndexManager, kg_manager: KnowledgeGraphManager, embedding_service: EmbeddingService):
+        self.vector_index = vector_index
+        self.kg_manager = kg_manager
+        self.query_processor = QueryProcessor()
+        self.embedding_service = embedding_service # Use centralized embedding service
+
+        # Cross-encoder for re-ranking (placeholder)
+        # In a real scenario, load a specific cross-encoder model
+        # self.cross_encoder = SentenceTransformer('cross-encoder/ms-marco-MiniLM-L-6-v2')
+        self.cross_encoder = None # For now, just use mock
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Hybrid retrieval combining vector search and knowledge graph, with re-ranking."""
+        query_analysis = self.query_processor.analyze_query(query)
+
+        query_embedding = self.embedding_service.get_embedding(query) # Use centralized service
+
+        # 1. Initial Vector Search (Retrieve more candidates than final top_k)
+        vector_candidates = self.vector_index.search(query_embedding, top_k * 5) # Retrieve more for re-ranking
+
+        # 2. Knowledge Graph Enhancement
+        kg_related_info = self.kg_manager.get_related_info(query_analysis.get('entities', []))
+
+        # Boost vector results based on KG relatedness and keyword overlap
+        enhanced_candidates = self._enhance_and_boost_candidates(vector_candidates, query_analysis, kg_related_info)
+
+        # Add KG-derived chunks as candidates if they are not already in vector_candidates
+        # This prevents completely isolated but relevant KG info from being missed
+        kg_chunk_candidates = []
+        existing_candidate_chunk_ids = {c['chunk_id'] for c in enhanced_candidates}
+
+        for item in kg_related_info:
+            if item['type'] == 'CHUNK':
+                chunk_id = item['id']
+                if chunk_id not in existing_candidate_chunk_ids:
+                    # Fetch full chunk data from vector_index.chunk_metadata
+                    chunk_data = self.vector_index.chunk_metadata.get(chunk_id)
+                    if chunk_data:
+                        # Assign a score based on KG distance, lower distance = higher score
+                        # 1.0 for distance 1, 0.5 for distance 2 etc.
+                        kg_score = max(0.1, 1.0 - (item['distance_from_query_entity'] * 0.2)) 
+                        kg_chunk_candidates.append({
+                            'chunk_id': chunk_id,
+                            'similarity_score': kg_score, 
+                            'content': chunk_data.get('content', ''),
+                            'document_id': chunk_data.get('document_id', ''),
+                            'keywords': chunk_data.get('keywords', []),
+                            'entities': chunk_data.get('entities', [])
+                        })
+                        existing_candidate_chunk_ids.add(chunk_id) # Add to seen list
+
+        enhanced_candidates.extend(kg_chunk_candidates)
+
+        # 3. Apply Re-ranking (Cross-encoder or RRF)
+        final_results = self._rank_results(enhanced_candidates, query_analysis, query)
+
+        return final_results[:top_k]
+
+    def _enhance_and_boost_candidates(self, candidates: List[Dict[str, Any]], query_analysis: Dict[str, Any], kg_related_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Enhance and boost scores of candidates based on KG relatedness and keyword overlap.
+        """
+        enhanced_results = []
+        query_entities = [e.lower() for e in query_analysis.get('entities', [])]
+        query_keywords = [kw.lower() for kw in query_analysis.get('keywords', [])]
+
+        for result in candidates:
+            enhanced_result = result.copy()
+            initial_score = enhanced_result.get('similarity_score', 0)
+
+            # --- Boost based on KG entity overlap ---
+            doc_entities = [e.get('name', '').lower() for e in result.get('entities', [])]
+            entity_overlap_count = len(set(query_entities) & set(doc_entities))
+            if entity_overlap_count > 0:
+                initial_score *= (1 + entity_overlap_count * 0.2) # Adjusted boost
+
+            # --- Boost based on direct keyword matches ---
+            content_lower = result.get('content', '').lower()
+            doc_keywords = [kw.lower() for kw in result.get('keywords', [])]
+
+            keyword_content_matches = sum(1 for kw in query_keywords if kw in content_lower)
+            keyword_tag_matches = len(set(query_keywords) & set(doc_keywords))
+            total_keyword_matches = keyword_content_matches + keyword_tag_matches
+
+            if total_keyword_matches > 0:
+                initial_score *= (1 + total_keyword_matches * 0.05) # Adjusted boost
+
+            # --- Boost based on KG related chunks/entities (if a chunk itself is KG-related) ---
+            is_kg_related = False
+            for kg_item in kg_related_info:
+                if kg_item['type'] == 'CHUNK' and kg_item['id'] == result['chunk_id']:
+                    is_kg_related = True
+                    break
+                # Also check if any entity within this chunk is directly related in the KG
+                if kg_item['type'] != 'CHUNK' and any(e['id'] == kg_item['id'] for e in result.get('entities', [])):
+                    is_kg_related = True
+                    break
+
+            if is_kg_related:
+                initial_score *= 1.1 # Small boost for KG relevance
+
+            enhanced_result['similarity_score'] = initial_score
+            enhanced_results.append(enhanced_result)
+
+        return enhanced_results
+
+    def _rank_results(self, results: List[Dict[str, Any]], query_analysis: Dict[str, Any], query_text: str) -> List[Dict[str, Any]]:
+        """
+        Final ranking of results, potentially using a cross-encoder for re-scoring.
+        Applies diversity filtering.
+        """
+        # First sort by the enhanced similarity score
+        results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+
+        # Cross-Encoder Re-ranking (if available) - Currently mocked
+        if self.cross_encoder and len(results) > 1:
+            sentence_pairs = [(query_text, r['content']) for r in results]
+            try:
+                # actual_scores = self.cross_encoder.predict(sentence_pairs)
+                actual_scores = np.random.rand(len(results)) * 0.5 + 0.5 # Mock scores between 0.5 and 1.0
+                for i, score in enumerate(actual_scores):
+                    results[i]['similarity_score'] = (results[i]['similarity_score'] + score) / 2
+                results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+                logger.info("Results re-ranked by cross-encoder (mocked).")
+            except Exception as e:
+                logger.warning(f"Cross-encoder re-ranking failed: {e}. Falling back to similarity score.")
+
+        # Apply diversity filter to ensure variety of source documents
+        diverse_results = []
+        seen_document_ids = set()
+        seen_chunk_ids = set() # To track actual chunks added
+
+        for result in results:
+            doc_id = result.get('document_id')
+            chunk_id = result.get('chunk_id')
+
+            if chunk_id in seen_chunk_ids: # Skip if this exact chunk has been added
+                continue
+
+            if doc_id not in seen_document_ids:
+                diverse_results.append(result)
+                seen_document_ids.add(doc_id)
+                seen_chunk_ids.add(chunk_id)
+            else:
+                # If document is already seen, only add if significantly better score,
+                # or if we still need more results to hit target k, and it's a different chunk
+                # Re-evaluate logic to allow *some* additional chunks from same document if highly relevant
+                # For simplicity here, we add it if its score is very high (e.g., top 20% of its doc's max score)
+                # This could be improved with Maximum Marginal Relevance (MMR) or explicit reranking by document.
+                
+                # Find the max score for this document already in diverse_results
+                max_score_for_doc = next((d['similarity_score'] for d in diverse_results if d['document_id'] == doc_id), 0)
+                
+                # Allow more chunks from the same document if they are significantly high scoring
+                # and we haven't filled up all top_k slots with diverse documents yet.
+                # Threshold of 0.9 * max_score_for_doc and limited to not exceed 2 chunks per doc initially.
+                # This is a heuristic and can be tuned.
+                chunks_from_this_doc_in_diverse = sum(1 for r in diverse_results if r['document_id'] == doc_id)
+
+                if result.get('similarity_score', 0) >= 0.9 * max_score_for_doc and \
+                   chunks_from_this_doc_in_diverse < 2: # Limit additional chunks from same doc
+                    diverse_results.append(result)
+                    seen_chunk_ids.add(chunk_id) # Mark this specific chunk as seen
+
+        # Ensure we return at least top_k results if available, even if some are duplicates after initial diversity filter
+        # This fills up the ranks using the initial sorted list if the diverse_results fall short of top_k.
+        final_selected_results = []
+        final_seen_chunk_ids = set()
+
+        # Add diverse results first
+        for r in diverse_results:
+            if r['chunk_id'] not in final_seen_chunk_ids:
+                final_selected_results.append(r)
+                final_seen_chunk_ids.add(r['chunk_id'])
+        
+        # Then fill remaining spots from the original sorted results (which might re-introduce less diverse but high-scoring chunks)
+        # This ensures we meet `top_k` if enough candidates exist.
+        for r in results:
+            if len(final_selected_results) >= len(results): # Cap at total available
+                break
+            if r['chunk_id'] not in final_seen_chunk_ids:
+                final_selected_results.append(r)
+                final_seen_chunk_ids.add(r['chunk_id'])
+
+
+        # Final sort after diversity for good measure (important for RRF type merging if applied)
+        final_selected_results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
+        return final_selected_results
+
+# =============================================================================
+# 8. RESPONSE GENERATOR
+# =============================================================================
+
+class ResponseGenerator:
+    def __init__(self):
+        self.client = OpenAI(
+            api_key=os.getenv("OPENAI_API_KEY"),
+        )
+        self.llm_model = LLM_MODEL_NAME
+        self.tokenizer = tiktoken.encoding_for_model(self.llm_model) # Initialize tokenizer
+
+    def generate_response(self, query: str, retrieved_chunks: List[Dict[str, Any]], query_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate response from retrieved information using an LLM."""
+
+        if not retrieved_chunks:
+            return {
+                'answer': "I couldn't find relevant information to answer your query.",
+                'confidence': 0.0,
+                'sources': []
+            }
+
+        # Prepare context for the LLM
+        context_parts = []
+        sources_for_output = []
+        seen_source_documents = set() # To track unique documents for citations
+        
+        current_context_tokens = 0
+        # Estimate prompt overhead (system message + user message boilerplate)
+        # This is a rough estimate; true overhead depends on model and prompt structure
+        prompt_overhead_tokens = len(self.tokenizer.encode("You are an intelligent assistant designed to provide answers based only on the provided information. Do not use any outside knowledge. If the answer cannot be found in the provided context, state that you cannot answer the question based on the given information. For each statement in your answer, indicate which 'Source Document ID' it came from. If a piece of information is found in multiple sources, you may cite all relevant sources. --- Information: --- Question: ")) + \
+                               len(self.tokenizer.encode(query)) # Add query tokens
+
+        available_tokens_for_context = LLM_MAX_TOKENS_CONTEXT - LLM_MAX_TOKENS_RESPONSE - prompt_overhead_tokens
+        
+        if available_tokens_for_context <= 0:
+            logger.warning(f"Not enough tokens available for context after reserving for response and prompt overhead. Available: {available_tokens_for_context}")
+            # Fallback to minimal context or error
+            return {
+                'answer': "System token limits prevent generating a full response. Try a shorter query.",
+                'confidence': 0.0,
+                'sources': []
+            }
+
+
+        for i, chunk in enumerate(retrieved_chunks):
+            chunk_content = chunk['content']
+            chunk_document_id = chunk['document_id']
+            
+            # Format the chunk content for LLM context
+            formatted_chunk = f"Source Document ID: {chunk_document_id}\nChunk Content:\n{chunk_content}\n---"
+            chunk_tokens = len(self.tokenizer.encode(formatted_chunk))
+
+            if current_context_tokens + chunk_tokens < available_tokens_for_context:
+                context_parts.append(formatted_chunk)
+                current_context_tokens += chunk_tokens
+
+                # Prepare sources for the final output
+                if chunk_document_id not in seen_source_documents:
+                    sources_for_output.append({
+                        'document_id': chunk.get('document_id', 'N/A'),
+                        'score': chunk.get('similarity_score', 0),
+                        'entities_in_chunk': [e.get('name', '') for e in chunk.get('entities', [])],
+                        'keywords_in_chunk': chunk.get('keywords', [])
+                    })
+                    seen_source_documents.add(chunk_document_id)
+            else:
+                logger.info(f"Stopped adding chunks due to token limit. Added {i} chunks. Total context tokens: {current_context_tokens}")
+                break
+
+        full_context = "\n\n".join(context_parts)
+
+        # Define the prompt for the LLM
+        # Instruct the LLM to only use provided information and cite sources.
+        prompt = f"""
+                    You are an intelligent assistant designed to provide answers based *only* on the provided information.
+                    Do not use any outside knowledge. If the answer cannot be found in the provided context, state that you cannot answer the question based on the given information.
+                    For each statement in your answer, indicate which "Source Document ID" it came from.
+                    If a piece of information is found in multiple sources, you may cite all relevant sources.
+
+                    ---
+                    Information:
+                    {full_context}
+                    ---
+
+                    Question: {query}
+                    """
+
+        llm_answer = "An error occurred while generating the response."
+        try:
+            chat_completion = self.client.chat.completions.create(
+                model=self.llm_model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0, # Make it less creative, more factual
+                max_tokens=LLM_MAX_TOKENS_RESPONSE # Adjust based on expected answer length
+            )
+            llm_answer = chat_completion.choices[0].message.content.strip()
+            logger.info("LLM response generated.")
+        except APIError as e:
+            logger.error(f"OpenAI API error: {e}")
+            llm_answer = f"An error occurred with the OpenAI API: {e}. Please check your API key and network."
+        except Exception as e:
+            logger.error(f"Error calling LLM: {e}")
+            llm_answer = f"An unexpected error occurred during response generation: {e}."
+
+        # Calculate confidence - simple average of top chunk scores
+        # More sophisticated confidence could involve LLM's own confidence or semantic similarity of answer to query
+        avg_score = sum(chunk.get('similarity_score', 0) for chunk in retrieved_chunks) / len(retrieved_chunks) if retrieved_chunks else 0.0
+        confidence = min(avg_score, 1.0) # Ensure it doesn't exceed 1.0
+
+        return {
+            'answer': llm_answer,
+            'confidence': confidence,
+            'sources': sources_for_output,
+            'context_used_chunks_count': len(context_parts) # Report actual number of chunks used in context
+        }
+
+# =============================================================================
+# 9. PERSISTENCE MANAGER
+# =============================================================================
+
+class StorageManager:
+    def __init__(self, data_path: Path, storage_path: Path):
+        self.data_path = data_path
+        self.storage_path = storage_path
+        self.storage_path.mkdir(parents=True, exist_ok=True) # Ensure storage dir exists
+
+    def _calculate_data_hash(self) -> str:
+        """Calculates a hash of all files in the data directory."""
+        hasher = hashlib.md5()
+        file_paths = sorted(list(self.data_path.rglob('*'))) # Get all files, sorted for consistency
+        for file_path in file_paths:
+            if file_path.is_file():
+                try:
+                    with open(file_path, 'rb') as f:
+                        # Read in chunks to handle large files
+                        for chunk in iter(lambda: f.read(4096), b''):
+                            hasher.update(chunk)
+                except Exception as e:
+                    logger.error(f"Error reading file {file_path} for hash calculation: {e}")
+                    # Optionally, decide if this should lead to a different hash or halt
+                    # For now, we'll just log and continue, potentially leading to re-processing
+                    continue 
+        return hasher.hexdigest()
+
+    def _get_last_data_hash(self) -> Optional[str]:
+        """Reads the last stored data hash."""
+        if LAST_DATA_HASH_PATH.exists():
+            try:
+                return LAST_DATA_HASH_PATH.read_text().strip()
+            except Exception as e:
+                logger.error(f"Error reading last data hash from {LAST_DATA_HASH_PATH}: {e}")
+                return None
+        return None
+
+    def _save_data_hash(self, current_hash: str) -> bool:
+        """Saves the current data hash."""
+        try:
+            LAST_DATA_HASH_PATH.write_text(current_hash)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving data hash to {LAST_DATA_HASH_PATH}: {e}")
+            return False
+
+    def is_data_changed(self) -> bool:
+        """Checks if the data directory has changed since last processing."""
+        current_hash = self._calculate_data_hash()
+        last_hash = self._get_last_data_hash()
+
+        if current_hash != last_hash:
+            logger.info("Data directory has changed or no previous hash found. Re-processing required.")
+            return True
+        logger.info("Data directory is unchanged. Loading pre-calculated data.")
+        return False
+
+    def save_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager):
+        """Saves all relevant data structures. Only saves hash if all saves succeed."""
+        all_saves_successful = True
+        
+        if not vector_index_manager.save_index():
+            all_saves_successful = False
+            logger.error("Failed to save FAISS index. Skipping data hash update.")
+        
+        if not kg_manager.save_graph():
+            all_saves_successful = False
+            logger.error("Failed to save Knowledge Graph. Skipping data hash update.")
+        
+        if all_saves_successful:
+            if self._save_data_hash(self._calculate_data_hash()):
+                logger.info("All data structures and data hash saved successfully.")
+            else:
+                logger.error("Failed to save data hash after successful index/graph saves. Data may be inconsistent on next load.")
+        else:
+            logger.error("Some data structures failed to save. Data hash not updated.")
+
+
+    def load_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager) -> bool:
+        """Loads all relevant data structures. Returns True if successful, False otherwise."""
+        vector_loaded = vector_index_manager.load_index()
+        kg_loaded = kg_manager.load_graph()
+        
+        if vector_loaded and kg_loaded and LAST_DATA_HASH_PATH.exists():
+            # Only consider "loaded" if data hash exists, implies previous full save
+            logger.info("All data structures loaded successfully.")
+            return True
+        
+        logger.warning("Incomplete or failed load of data structures. Will re-process data.")
+        return False
+
+
+# =============================================================================
+# 10. MAIN RAG SYSTEM
+# =============================================================================
+
+class SimpleAdvancedRAGSystem:
+    def __init__(self):
+        # Initialize shared embedding service
+        self.embedding_service = EmbeddingService(
+            api_key=os.getenv("OPENAI_API_KEY"),
+            model_name=EMBEDDING_MODEL_NAME,
+            embedding_dim=EMBEDDING_DIM
+        )
+
+        self.storage_manager = StorageManager(DATA_PATH, STORAGE_PATH)
+        self.doc_processor = DocumentProcessor(self.embedding_service) # Pass embedding service
+        self.vector_index = VectorIndexManager()
+        self.kg_manager = KnowledgeGraphManager()
+        self.retrieval_engine = HybridRetrievalEngine(self.vector_index, self.kg_manager, self.embedding_service) # Pass embedding service
+        self.response_generator = ResponseGenerator()
+
+        logger.info("RAG System components initialized.")
+
+    def initialize_knowledge_base(self):
+        """Initializes or re-processes the knowledge base based on data changes."""
+        # Attempt to load existing data
+        if self.storage_manager.load_all(self.vector_index, self.kg_manager):
+            # Data loaded, now check if original data files have changed
+            if not self.storage_manager.is_data_changed():
+                logger.info("Knowledge base is up-to-date. No re-processing needed.")
+                return
+
+        logger.info("Re-processing documents due to data changes or no prior data found.")
+        # Clear existing data structures before re-processing
+        self.vector_index._initialize_index() 
+        self.vector_index.chunk_metadata = {}
+        self.vector_index.id_to_index = {}
+        self.vector_index.index_to_id = {}
+        self.vector_index.current_index = 0
+
+        self.kg_manager.graph = nx.DiGraph()
+        self.kg_manager.entities = {}
+        self.kg_manager.relations = {}
+        self.kg_manager.document_chunks = {}
+
+        self._process_and_store_documents()
+        self.storage_manager.save_all(self.vector_index, self.kg_manager)
+        logger.info("Knowledge base re-processing complete and saved.")
+
+    def _process_and_store_documents(self):
+        """Processes documents from the DATA_PATH and stores them."""
+        documents = self._load_documents_from_directory(DATA_PATH)
+
+        if not documents:
+            logger.warning(f"No documents found in {DATA_PATH}. Knowledge base will be empty.")
+            return
+
+        all_chunks = []
+        all_entities = []
+        all_relations = []
+
+        for doc in documents:
+            doc_id = doc['id']
+            content = doc['content']
+
+            # Process document
+            chunks, entities, relations = self.doc_processor.process_document(doc_id, content)
+
+            all_chunks.extend(chunks)
+            all_entities.extend(entities)
+            all_relations.extend(relations)
+
+        self.vector_index.add_chunks(all_chunks)
+        self.kg_manager.add_data(all_chunks, all_entities, all_relations) # Pass chunks to KG for chunk nodes
+
+        logger.info(f"Processed {len(documents)} documents, Created {len(all_chunks)} chunks, {len(all_entities)} Entities, {len(all_relations)} Relations.")
+
+    def _load_documents_from_directory(self, directory: Path) -> List[Dict[str, str]]:
+        """Load documents from a specified directory."""
+        documents = []
+        for file_path in directory.iterdir():
+            if file_path.is_file():
+                try:
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    documents.append({'id': file_path.name, 'content': content})
+                    logger.info(f"Loaded document: {file_path.name}")
+                except Exception as e:
+                    logger.error(f"Could not read {file_path}: {e}")
+        return documents
+
+    def query(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
+        """Process a query and return results."""
+        logger.info(f"Processing query: '{query_text}'")
+        try:
+            # Retrieve relevant chunks
+            retrieved_chunks = self.retrieval_engine.retrieve(query_text, top_k)
+            
+            # Analyze query for response generation (can reuse analysis from retrieval engine if desired)
+            query_analysis = self.retrieval_engine.query_processor.analyze_query(query_text)
+            
+            # Generate response
+            response = self.response_generator.generate_response(
+                query_text, retrieved_chunks, query_analysis
+            )
+            
+            # Add metadata
+            response['query_analysis'] = query_analysis
+            response['timestamp'] = datetime.now().isoformat()
+            response['status'] = 'success'
+            
+            logger.info("Query processed successfully.")
+            return response
+            
+        except Exception as e:
+            logger.exception(f"Error processing query: {e}") # Use exception to log traceback
+            return {
+                'status': 'error',
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+
+    def get_system_stats(self) -> Dict[str, Any]:
+        """Get system statistics."""
+        try:
+            return {
+                'status': 'success',
+                'vector_index_size': self.vector_index.index.ntotal if self.vector_index.index else 0,
+                'knowledge_graph_nodes': self.kg_manager.graph.number_of_nodes(),
+                'knowledge_graph_edges': self.kg_manager.graph.number_of_edges(),
+                'total_entities': len(self.kg_manager.entities),
+                'total_relations': len(self.kg_manager.relations),
+                'total_chunks_in_kg': len(self.kg_manager.document_chunks),
+                'timestamp': datetime.now().isoformat()
+            }
+        except Exception as e:
+            logger.error(f"Error getting system stats: {e}")
+            return {
+                'status': 'error',
+                'error': str(e),
+                'timestamp': datetime.now().isoformat()
+            }
+
+# =============================================================================
+# 11. USAGE EXAMPLE
+# =============================================================================
+
+if __name__ == "__main__":
+    # Initialize RAG system
+    rag_system = SimpleAdvancedRAGSystem()
+
+    # Initialize the knowledge base (loads from disk or re-processes)
+    rag_system.initialize_knowledge_base()
+    print("\nKnowledge Base Ready!")
+
+    print(f"System Stats: {rag_system.get_system_stats()}\n")
+
+    print("Enter your query (type 'exit' to quit):")
+    while True:
+        try:
+            user_input = input("Query> ").strip()
+            if user_input.lower() in ("exit", "quit"):
+                print("Exiting interactive RAG system. Goodbye!")
+                break
+            if not user_input:
+                continue
+
+            query_result = rag_system.query(user_input)
+            print("-" * 50)
+            print(f"Answer: {query_result['answer']}")
+            print(f"Confidence: {query_result['confidence']:.2f}")
+            print(f"Sources Used:")
+            for src in query_result['sources']:
+                print(f"  - Document: {src['document_id']} (Score: {src['score']:.2f})")
+                print(f"    Entities: {', '.join(src['entities_in_chunk']) if src['entities_in_chunk'] else 'None'}")
+                print(f"    Keywords: {', '.join(src['keywords_in_chunk']) if src['keywords_in_chunk'] else 'None'}")
+            print(f"Query Analysis: {query_result['query_analysis']}")
+            print("-" * 50 + "\n")
+        except (KeyboardInterrupt, EOFError):
+            print("\nExiting interactive RAG system. Goodbye!")
+            break
+        except Exception as e:
+            logger.exception(f"An error occurred during interactive query loop: {e}")
+            print(f"An unexpected error occurred: {e}")
+            continue
