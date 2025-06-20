@@ -11,3 +11,4 @@ plotly
 pandas
 tiktoken
 matplotlib
+sentence-transformers
