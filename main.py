@@ -23,7 +23,7 @@ from spacy.matcher import Matcher, PhraseMatcher
 
 # OpenAI & Sentence Transformers
 from openai import OpenAI, APIError
-from sentence_transformers import SentenceTransformer # UNCOMMENT or ADD this line
+from sentence_transformers import SentenceTransformer # This line is now active for Sentence Transformers
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -35,19 +35,20 @@ load_dotenv()
 # =============================================================================
 # Configuration Constants (Loaded from .env or default values)
 # =============================================================================
-EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "text-embedding-ada-002")
+# Embedding Model Configuration (for local embeddings via Sentence Transformers)
+EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2") # Default to ST model
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384")) # Default dimension for all-MiniLM-L6-v2
+
+# LLM Model Configuration (for answer generation via OpenAI API)
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-3.5-turbo")
-EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536")) # Ada-002 dimension
-
-# Document Processing Settings (explicitly using token-based names)
-# These constants are now correctly defined globally from environment variables
-TARGET_CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "512")) # Target max tokens per chunk for embedding
-CHUNK_OVERLAP_SENTENCES = int(os.getenv("CHUNK_OVERLAP_SENTENCES", "2")) # Overlap in sentences
-MIN_CHUNK_SIZE_TOKENS = int(os.getenv("MIN_CHUNK_SIZE_TOKENS", "50")) # Minimum tokens for a chunk
-
-# LLM Context Window Settings
+LLM_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7")) # Renamed from OPENAI_TEMPERATURE
 LLM_MAX_TOKENS_CONTEXT = int(os.getenv("LLM_MAX_TOKENS_CONTEXT", "4000")) # Max input tokens for LLM
 LLM_MAX_TOKENS_RESPONSE = int(os.getenv("LLM_MAX_TOKENS_RESPONSE", "1000")) # Max output tokens for LLM response
+
+# Document Processing Settings (using token-based chunking for local models)
+TARGET_CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "512")) # Max tokens per chunk for embeddings
+CHUNK_OVERLAP_SENTENCES = int(os.getenv("CHUNK_OVERLAP_SENTENCES", "2")) # Overlap in sentences
+MIN_CHUNK_SIZE_TOKENS = int(os.getenv("MIN_CHUNK_SIZE_TOKENS", "20")) # Minimum tokens for a chunk
 
 # Storage Paths
 STORAGE_PATH = Path(os.getenv("STORAGE_PATH", "./storage"))
@@ -64,9 +65,20 @@ KG_RELATIONS_PATH = STORAGE_PATH / "kg_relations.json"
 LAST_DATA_HASH_PATH = STORAGE_PATH / "data_hash.txt"
 KG_CHUNKS_PATH = STORAGE_PATH / "kg_chunks.json" # Defined explicitly for clarity
 
+# System Settings
+ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true" # Boolean from string
+CACHE_DIR = Path(os.getenv("CACHE_DIR", "./cache"))
+MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
+CACHE_VALIDITY_DAYS = int(os.getenv("CACHE_VALIDITY_DAYS", "1"))
+
+# SpaCy Model Configuration
+SPACY_MODEL = os.getenv("SPACY_MODEL", "en_core_web_sm")
+
 # Ensure storage and data directory exist
 STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 DATA_PATH.mkdir(parents=True, exist_ok=True)
+CACHE_DIR.mkdir(parents=True, exist_ok=True) # Ensure cache directory also exists
 
 # =============================================================================
 # 1. DATA STRUCTURES
@@ -147,33 +159,33 @@ class KnowledgeRelation:
 
 class EmbeddingService:
     """Service for generating text embeddings. Can use OpenAI or Sentence Transformers."""
-    def __init__(self, api_key: Optional[str] = None, model_name: str = "text-embedding-ada-002", embedding_dim: int = 1536):
+    def __init__(self, api_key: Optional[str] = None, model_name: str = "all-MiniLM-L6-v2", embedding_dim: int = 384):
         self.model_name = model_name
         self.embedding_dim = embedding_dim
 
         # Determine whether to use OpenAI API or a local Sentence Transformer model
-        if model_name.startswith("text-embedding-") or model_name.startswith("gpt-"): # Common OpenAI embedding models
+        if model_name.startswith("text-embedding-") or model_name.startswith("gpt-"):
             if not api_key:
-                raise ValueError("OPENAI_API_KEY must be set for OpenAI embedding models.")
+                raise ValueError(f"OPENAI_API_KEY must be set for OpenAI embedding model: {model_name}")
             self.client = OpenAI(api_key=api_key)
             self.model_type = "openai_api"
-            self.tokenizer = tiktoken.encoding_for_model(model_name) # Tiktoken for OpenAI models
+            self.tokenizer = tiktoken.encoding_for_model(model_name)
             self.EMBEDDING_MODEL_MAX_TOKENS = 8192 # OpenAI Ada-002 limit
             logger.info(f"EmbeddingService initialized with OpenAI API model: {model_name}")
         else: # Assume it's a local Sentence Transformer model
             try:
                 self.model = SentenceTransformer(model_name)
                 self.model_type = "sentence_transformer"
-                # For local models, use their internal tokenizer if needed, or simple char len for limits
-                # tiktoken is not directly compatible with non-OpenAI models for exact token counts
-                # but we still need it for LLM operations. For local embedding, we rely on its own processing.
-                # We will reuse the LLM's tokenizer for global token estimates if needed.
-                self.tokenizer = tiktoken.encoding_for_model(LLM_MODEL_NAME) # Re-use LLM tokenizer for general counts
-                # Set a conservative max token count for local models, or rely on internal handling
-                self.EMBEDDING_MODEL_MAX_TOKENS = 512 # A common safe max for smaller ST models for internal logic, but ST handles input lengths automatically.
-                logger.info(f"EmbeddingService initialized with local Sentence Transformer model: {model_name}")
+                # For local models, tiktoken is only used for LLM side, not for ST's internal tokenization.
+                self.tokenizer = tiktoken.encoding_for_model(LLM_MODEL_NAME) # Use LLM tokenizer for generic token counting
+                self.EMBEDDING_MODEL_MAX_TOKENS = self.model.max_seq_length # Use the actual model's max sequence length
+                if self.EMBEDDING_MODEL_MAX_TOKENS is None:
+                    # Fallback if model doesn't expose max_seq_length, choose a conservative default
+                    self.EMBEDDING_MODEL_MAX_TOKENS = 512
+                    logger.warning(f"SentenceTransformer model '{model_name}' did not expose max_seq_length. Defaulting to {self.EMBEDDING_MODEL_MAX_TOKENS} tokens for internal chunking checks.")
+                logger.info(f"EmbeddingService initialized with local Sentence Transformer model: {model_name} (Max Seq Len: {self.EMBEDDING_MODEL_MAX_TOKENS})")
             except Exception as e:
-                logger.error(f"Failed to load Sentence Transformer model '{model_name}'. Ensure it's valid and downloaded. Error: {e}")
+                logger.error(f"Failed to load Sentence Transformer model '{model_name}'. Ensure it's valid and downloaded (e.g., pip install sentence-transformers, then model name is correct in .env). Error: {e}")
                 raise RuntimeError(f"Failed to load embedding model: {model_name}")
 
     def get_embedding(self, text: str, retries: int = 3, delay: int = 1) -> np.ndarray:
@@ -192,7 +204,7 @@ class EmbeddingService:
                     if e.code == 'invalid_request_error' and "context length" in str(e):
                         logger.error(f"OpenAI API confirmed token limit error ({token_count} tokens) for text. Snippet: {text[:200]}... Error: {e}")
                         return np.zeros(self.embedding_dim, dtype=np.float32)
-
+                    
                     logger.warning(f"OpenAI API error during embedding (attempt {i+1}/{retries}): {e}")
                     if i < retries - 1:
                         import time
@@ -203,17 +215,20 @@ class EmbeddingService:
                 except Exception as e:
                     logger.error(f"Unexpected error getting OpenAI embedding for text: {text[:50]}... Error: {e}")
                     return np.zeros(self.embedding_dim, dtype=np.float32)
-            return np.zeros(self.embedding_dim, dtype=np.float32) # Should not be reached for OpenAI
+            return np.zeros(self.embedding_dim, dtype=np.float32)
 
         elif self.model_type == "sentence_transformer":
             try:
-                # Sentence-Transformers automatically handles tokenization and truncation based on model limits
-                # and often performs better with full sentences/paragraphs up to its max input length.
                 embedding = self.model.encode(text, convert_to_numpy=True).astype(np.float32)
                 if embedding.shape[0] != self.embedding_dim:
-                    logger.warning(f"SentenceTransformer embedding dimension mismatch. Expected {self.embedding_dim}, got {embedding.shape[0]}. Check EMBEDDING_DIM in .env for {self.model_name}.")
-                    # Fallback to zero array if dimension is wrong, although this shouldn't happen if setup is correct
-                    return np.zeros(self.embedding_dim, dtype=np.float32)
+                    logger.warning(f"SentenceTransformer embedding dimension mismatch. Expected {self.embedding_dim}, got {embedding.shape[0]}. Check EMBEDDING_DIM in .env for {self.model_name}. Attempting to reshape or pad.")
+                    # Attempt to reshape/pad if dimensions are off (though better to have correct config)
+                    if embedding.shape[0] < self.embedding_dim:
+                        padded_embedding = np.pad(embedding, (0, self.embedding_dim - embedding.shape[0]), 'constant')
+                        return padded_embedding.astype(np.float32)
+                    elif embedding.shape[0] > self.embedding_dim:
+                        return embedding[:self.embedding_dim].astype(np.float32) # Truncate if too long
+                    
                 return embedding
             except Exception as e:
                 logger.error(f"Error generating Sentence Transformer embedding for text: {text[:50]}... Error: {e}")
@@ -233,7 +248,7 @@ class DocumentProcessor:
         self.tokenizer = embedding_service.tokenizer 
 
         try:
-            self.nlp = spacy.load("en_core_web_sm")
+            self.nlp = spacy.load(SPACY_MODEL) # Use SPACY_MODEL from .env
             self.nlp.max_length = 2_000_000 # Increase max_length for larger documents
             self.matcher = Matcher(self.nlp.vocab)
             self.phrase_matcher = PhraseMatcher(self.nlp.vocab) # Initialize PhraseMatcher
@@ -324,15 +339,14 @@ class DocumentProcessor:
             ]])
 
         except OSError:
-            logger.error("spaCy model 'en_core_web_sm' not found. Please install with: python -m spacy download en_core_web_sm")
+            logger.error(f"spaCy model '{SPACY_MODEL}' not found. Please install with: python -m spacy download {SPACY_MODEL}")
             self.nlp = None
             self.matcher = None
-            self.phrase_matcher = None # Ensure phrase_matcher is also None if nlp fails
+            self.phrase_matcher = None
 
-        # Use the newly defined constants for chunking
         self.target_chunk_size_tokens = TARGET_CHUNK_SIZE_TOKENS 
         self.chunk_overlap_sentences = CHUNK_OVERLAP_SENTENCES 
-        self.min_chunk_size_tokens = MIN_CHUNK_SIZE_TOKENS # Initialize min chunk size
+        self.min_chunk_size_tokens = MIN_CHUNK_SIZE_TOKENS 
 
         self.tfidf = TfidfVectorizer(max_features=100, stop_words='english')
 
@@ -344,7 +358,6 @@ class DocumentProcessor:
         # Extract entities first
         entities = self._extract_entities(cleaned_content, document_id)
 
-        # Corrected: Pass cleaned_content directly to _create_chunks
         chunks = self._create_chunks(cleaned_content, document_id) 
 
         # Generate embeddings for each chunk
@@ -363,7 +376,14 @@ class DocumentProcessor:
         return chunks, entities, relations
 
     def _clean_text(self, content: str) -> str:
+        # Remove non-ASCII characters that often result from bad PDF OCR
+        content = re.sub(r'[^\x00-\x7F]+', ' ', content) # Remove non-ASCII characters
+        # Remove common PDF artifacts (e.g., multiple spaces, newlines, form feed)
         content = re.sub(r'\s+', ' ', content)
+        # Remove very short lines or common headers/footers if they are repetitive and non-content
+        # This part might need tuning per document type
+        # content = re.sub(r'Page \d+ of \d+', '', content, flags=re.IGNORECASE) # Example
+        # content = re.sub(r'CEUR-WS.org/Vol-\d+/\S+\.pdf', '', content) # Example from your doc
         return content.strip()
 
     def _create_chunks(self, content: str, doc_id: str) -> List[DocumentChunk]:
@@ -374,13 +394,12 @@ class DocumentProcessor:
         chunks = []
         chunk_index = 0
         
-        # Define common separators in decreasing order of semantic importance
-        # Added a specific maximum fallback character chunk size to ensure no chunk is ever too big.
-        # This is a critical safeguard for single very long "sentences" or malformed text.
-        EMBEDDING_MODEL_MAX_TOKENS = 8192 # Ensure this is consistent with EmbeddingService
-        # A very safe fallback character split size, slightly less than the max model limit
-        # This will be used only if all other semantic splitting fails
-        FALLBACK_CHAR_CHUNK_SIZE = int(EMBEDDING_MODEL_MAX_TOKENS * 0.95) # Leave some buffer
+        # Use the EMBEDDING_MODEL_MAX_TOKENS from the embedding service instance
+        # This allows it to dynamically adapt to the actual max_seq_length of the loaded ST model.
+        EMBEDDING_MODEL_HARD_MAX_TOKENS = self.embedding_service.EMBEDDING_MODEL_MAX_TOKENS 
+        
+        # A very safe fallback character split size, ensuring it's always smaller than the hard max.
+        FALLBACK_CHAR_CHUNK_SIZE = int(EMBEDDING_MODEL_HARD_MAX_TOKENS * 0.9) # Leave a bit more buffer
 
         separators = ["\n\n", "\n", ". ", "? ", "! ", " "] 
 
@@ -388,25 +407,23 @@ class DocumentProcessor:
             if not text:
                 return []
             
-            text_tokens = len(self.tokenizer.encode(text))
+            text_tokens = len(self.tokenizer.encode(text)) # Use LLM tokenizer for this count
             
-            # Base case: if text fits within target chunk size, return it
+            # Base case: if text fits within TARGET_CHUNK_SIZE_TOKENS, return it
             if text_tokens <= self.target_chunk_size_tokens:
                 return [text]
 
             # If no more semantic separators, force split by character
             if not current_separators:
                 # Break text into chunks of FALLBACK_CHAR_CHUNK_SIZE characters
-                # This is the ultimate safeguard against oversized single 'parts'
                 sub_chunks = []
                 for i in range(0, len(text), FALLBACK_CHAR_CHUNK_SIZE):
                     sub_chunk = text[i:i + FALLBACK_CHAR_CHUNK_SIZE]
                     sub_chunks.append(sub_chunk)
                     
-                    # Log a warning if even after char splitting, a sub_chunk exceeds the actual token limit
-                    # This could happen if a character chunk happens to encode into many more tokens
-                    if len(self.tokenizer.encode(sub_chunk)) > EMBEDDING_MODEL_MAX_TOKENS:
-                        logger.warning(f"Recursive char split produced a chunk of {len(self.tokenizer.encode(sub_chunk))} tokens, still exceeding {EMBEDDING_MODEL_MAX_TOKENS}. Document: {doc_id}. Consider a smaller FALLBACK_CHAR_CHUNK_SIZE or checking source document. Snippet: {sub_chunk[:100]}...")
+                    # Log a warning if even after char splitting, a sub_chunk still exceeds the hard token limit
+                    if len(self.tokenizer.encode(sub_chunk)) > EMBEDDING_MODEL_HARD_MAX_TOKENS:
+                        logger.warning(f"Recursive char split produced a chunk of {len(self.tokenizer.encode(sub_chunk))} tokens, still exceeding {EMBEDDING_MODEL_HARD_MAX_TOKENS}. Document: {doc_id}. Consider reducing CHUNK_SIZE_TOKENS or checking source document. Snippet: {sub_chunk[:100]}...")
                 return sub_chunks
 
 
@@ -455,41 +472,29 @@ class DocumentProcessor:
             return collected_chunks_from_recursion
 
         # Perform initial recursive split
-        # 'content' here is the `cleaned_content` passed from `process_document`
         pre_overlap_chunks = _split_recursively(content, separators)
         
         # Now, combine chunks with overlap, ensuring final chunk size constraint
-        # This part processes the `pre_overlap_chunks` which are already guaranteed to be
-        # within `target_chunk_size_tokens` (or force-split if larger than model limit).
         current_overlap_sentences_buffer = []
         current_combined_chunk_content = []
         current_combined_chunk_tokens = 0
 
         # Attempt to make sentence-level overlaps from the pre_overlap_chunks
-        # This aims to preserve semantic boundaries where possible for the overlap.
         for pre_chunk_content in pre_overlap_chunks:
             if self.nlp:
-                # If spaCy is loaded, get sentences from this pre_chunk for more precise overlap
                 doc_pre_chunk = self.nlp(pre_chunk_content)
                 sentences_from_pre_chunk = [sent.text for sent in doc_pre_chunk.sents]
             else:
-                # Fallback to simple split if spaCy not available
                 sentences_from_pre_chunk = [s.strip() for s in pre_chunk_content.split('. ') if s.strip()]
 
-            # Handle the first chunk's initiation or subsequent chunks
             for sent in sentences_from_pre_chunk:
                 sent_tokens = len(self.tokenizer.encode(sent))
 
-                # If adding the current sentence would make the chunk too large, finalize current chunk
-                # and start a new one with overlap
-                # Check against target_chunk_size_tokens, which is the desired max, not the hard model limit
                 if current_combined_chunk_tokens + sent_tokens > self.target_chunk_size_tokens:
                     if current_combined_chunk_content: # Ensure there's content to save
                         final_chunk_text = " ".join(current_combined_chunk_content)
                         final_chunk_tokens = len(self.tokenizer.encode(final_chunk_text))
                         
-                        # Only add if it meets minimum size or it's the only remaining content in this loop
-                        # or if this is the first chunk being created
                         if final_chunk_tokens >= self.min_chunk_size_tokens or not chunks:
                              chunks.append(DocumentChunk(
                                 id=str(uuid.uuid4()),
@@ -499,29 +504,24 @@ class DocumentProcessor:
                             ))
                              chunk_index += 1
                         else:
-                            # This chunk is too small and not the first/only one, so skip it
                             logger.debug(f"Skipping chunk {chunk_index} from {doc_id} due to small size: {final_chunk_tokens} tokens.")
                             
-                    # Start new chunk with overlap
-                    current_combined_chunk_content = list(current_overlap_sentences_buffer) # Copy buffer
+                    current_combined_chunk_content = list(current_overlap_sentences_buffer)
                     current_combined_chunk_content.append(sent)
                     current_combined_chunk_tokens = len(self.tokenizer.encode(" ".join(current_combined_chunk_content)))
-                    # Update buffer for the *next* iteration's overlap
                     current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:] 
                 else:
                     current_combined_chunk_content.append(sent)
                     current_combined_chunk_tokens += sent_tokens
-                    # Update buffer for the *next* iteration's overlap
                     current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:]
 
 
-        # Add the very last remaining chunk (after all pre_overlap_chunks and their sentences have been processed)
+        # Add the very last remaining chunk
         if current_combined_chunk_content:
             final_chunk_text = " ".join(current_combined_chunk_content)
             final_chunk_tokens = len(self.tokenizer.encode(final_chunk_text))
             
-            # Always add the very last chunk if it has content, regardless of min_size, to avoid data loss
-            if final_chunk_tokens > 0: # Ensure it's not an empty string
+            if final_chunk_tokens > 0:
                 chunks.append(DocumentChunk(
                     id=str(uuid.uuid4()),
                     document_id=doc_id,
@@ -876,72 +876,98 @@ class VectorIndexManager:
         logger.info("No existing FAISS index found. Starting fresh.")
         return False
 
+
 # =============================================================================
 # 5. KNOWLEDGE GRAPH MANAGER
 # =============================================================================
 
 class KnowledgeGraphManager:
     def __init__(self):
-        self.graph = nx.DiGraph() # Directed graph for relations
+        self.graph = nx.MultiDiGraph() # Directed graph for relations
         self.entities: Dict[str, KnowledgeEntity] = {}
         self.relations: Dict[str, KnowledgeRelation] = {}
         self.document_chunks: Dict[str, DocumentChunk] = {} # Store chunk objects for KG nodes (metadata only)
 
     def add_data(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity], relations: List[KnowledgeRelation]):
-        """Add entities, relations, and chunks to the graph."""
-        # Add chunks as nodes first
-        for chunk in chunks:
-            if chunk.id not in self.document_chunks:
-                self.document_chunks[chunk.id] = chunk
-                self.graph.add_node(chunk.id, type='CHUNK', content=chunk.content[:200] + '...') # Store snippet
-            # Update existing chunk's content snippet if it was added as a node earlier
-            else:
-                self.graph.nodes[chunk.id]['content'] = chunk.content[:200] + '...'
+            """Add entities, relations, and chunks to the graph."""
+            # Ensure ALL chunks are added as nodes with their metadata
+            for chunk in chunks:
+                if chunk.id not in self.document_chunks:
+                    self.document_chunks[chunk.id] = chunk
+                # Always add/update the node in the graph, ensuring properties are set
+                self.graph.add_node(chunk.id, type='CHUNK', content=chunk.content[:200] + '...', document_id=chunk.document_id, chunk_index=chunk.chunk_index)
 
 
-        # Add entities
-        for entity in entities:
-            if entity.id not in self.entities:
-                self.entities[entity.id] = entity
-                # Only add if node not already present (could be a chunk ID too if ID collision, though unlikely)
-                if entity.id not in self.graph:
-                    self.graph.add_node(entity.id, name=entity.name, type=entity.entity_type)
-            else:
-                # Update existing entity's document and chunk lists if it's new data
-                existing_entity = self.entities[entity.id]
-                existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
-                existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
-                self.graph.nodes[entity.id]['name'] = entity.name # Ensure name is updated if needed
+            # Ensure ALL entities are added as nodes with their metadata
+            for entity in entities:
+                if entity.id not in self.entities:
+                    self.entities[entity.id] = entity # Store the entity object
+                    # Add node to graph for this entity. Make sure properties are always set/updated.
+                    self.graph.add_node(entity.id, name=entity.name, type=entity.entity_type, document_ids=entity.document_ids, related_chunks=entity.related_chunks)
+                else:
+                    # Update existing entity's attributes if it's already processed from another chunk/document
+                    existing_entity = self.entities[entity.id]
+                    existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
+                    existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
+                    # Update graph node attributes as well
+                    self.graph.nodes[entity.id]['name'] = entity.name
+                    self.graph.nodes[entity.id]['type'] = entity.entity_type # Ensure type is consistent
+                    self.graph.nodes[entity.id]['document_ids'] = existing_entity.document_ids
+                    self.graph.nodes[entity.id]['related_chunks'] = existing_entity.related_chunks
+
 
             # Add MENTIONS relations between chunks and entities
-            for chunk_id in entity.related_chunks:
-                if chunk_id in self.graph and entity.id in self.graph:
-                    # Check if edge already exists to avoid duplicates
-                    if not self.graph.has_edge(chunk_id, entity.id):
-                        self.graph.add_edge(chunk_id, entity.id, relation_type='MENTIONS', confidence=1.0)
-                    if not self.graph.has_edge(entity.id, chunk_id): # Bi-directional for easier traversal
-                        self.graph.add_edge(entity.id, chunk_id, relation_type='MENTIONED_IN', confidence=1.0)
+            for entity in entities: # Iterate over *all* entities identified
+                for chunk_id in entity.related_chunks:
+                    # IMPORTANT: Ensure both the chunk node AND entity node are already in the graph
+                    # from the loops above before trying to add an edge.
+                    if chunk_id in self.graph and entity.id in self.graph:
+                        # Use a composite key for MENTIONS to prevent duplicates if an entity is mentioned multiple times in the same chunk
+                        # or if the same entity has multiple relations to the same chunk (e.g. from different sentences if you ever add those).
+                        # For a simple MENTIONS relationship, (chunk_id, entity.id, 'MENTIONS') is usually unique enough.
+                        if self.graph.get_edge_data(chunk_id, entity.id, key='MENTIONS') is None:
+                            self.graph.add_edge(chunk_id, entity.id, key='MENTIONS', relation_type='MENTIONS', confidence=1.0)
+                        if self.graph.get_edge_data(entity.id, chunk_id, key='MENTIONED_IN') is None: # Bi-directional for easier traversal
+                            self.graph.add_edge(entity.id, chunk_id, key='MENTIONED_IN', relation_type='MENTIONED_IN', confidence=1.0)
+                    else:
+                        # These warnings are expected if entities or chunks were filtered out earlier (e.g., too short)
+                        logger.debug(f"Skipping MENTIONS relation: Chunk {chunk_id} or Entity {entity.id} not found in graph for direct linking.") # Changed to debug
 
 
-        # Add relations (between entities)
-        for relation in relations:
-            # Only add if both source and target entities exist in the graph
-            if relation.source_entity in self.graph and relation.target_entity in self.graph:
-                if relation.id not in self.relations: # Only add new relations
-                    self.relations[relation.id] = relation
-                    # Check if edge already exists with same type to avoid duplicates for directed graph
-                    if not self.graph.has_edge(relation.source_entity, relation.target_entity, key=relation.relation_type):
-                        self.graph.add_edge(
-                            relation.source_entity,
-                            relation.target_entity,
-                            relation_type=relation.relation_type,
-                            confidence=relation.confidence,
-                            document_id=relation.document_id,
-                            sentence=relation.sentence
-                        )
-            else:
-                logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph. One might be a chunk.")
-        logger.info(f"Added {len(entities)} entities, {len(relations)} relations, and {len(chunks)} chunks to KG. Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}")
+            # Add relations (between entities)
+            # Use a set to track already added relation tuples (source, target, type) for MultiDiGraph
+            # This prevents redundant edges of the *same type* between the same two entities.
+            added_relation_tuples = set()
+
+            for relation in relations:
+                # Only add if both source and target entities exist in the graph and this specific relation type isn't duplicated
+                if relation.source_entity in self.graph and relation.target_entity in self.graph:
+                    relation_tuple = (relation.source_entity, relation.target_entity, relation.relation_type)
+                    if relation_tuple not in added_relation_tuples:
+                        # We store the original relation object in self.relations to keep its specific UUID.
+                        # Then add the edge to the graph using relation.id as the key to make each relation object a distinct edge.
+                        # This ensures the graph accurately reflects the number of relation *objects* found.
+                        if self.graph.get_edge_data(relation.source_entity, relation.target_entity, key=relation.id) is None: # Use relation.id as the edge key
+                            self.relations[relation.id] = relation # Store the relation object by its unique ID
+                            self.graph.add_edge(
+                                relation.source_entity,
+                                relation.target_entity,
+                                key=relation.id, # Use relation's unique ID as the edge key in MultiDiGraph
+                                relation_type=relation.relation_type,
+                                confidence=relation.confidence,
+                                document_id=relation.document_id,
+                                sentence=relation.sentence
+                            )
+                            added_relation_tuples.add(relation_tuple) # Track by (source, target, type) to avoid semantic duplication
+                    else:
+                        logger.debug(f"Skipping semantically duplicate relation type '{relation.relation_type}' between {relation.source_entity} and {relation.target_entity}.")
+                else:
+                    logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph during relation addition.")
+            
+            # After adding all nodes and edges, log the actual graph counts
+            logger.info(f"KG Population Status: Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}.")
+            # Ensure this logger is after all additions
+            logger.info(f"Total entities stored: {len(self.entities)}, Total relations stored: {len(self.relations)}, Total document chunks stored: {len(self.document_chunks)}")
 
     def get_related_info(self, query_entities: List[str], max_distance: int = 2) -> List[Dict[str, Any]]:
         """
@@ -1068,9 +1094,9 @@ class KnowledgeGraphManager:
 class QueryProcessor:
     def __init__(self):
         try:
-            self.nlp = spacy.load("en_core_web_sm")
+            self.nlp = spacy.load(SPACY_MODEL) # Use SPACY_MODEL from .env
         except OSError:
-            logger.error("spaCy model 'en_core_web_sm' not found for QueryProcessor. Install with: python -m spacy download en_core_web_sm")
+            logger.error(f"spaCy model '{SPACY_MODEL}' not found for QueryProcessor. Install with: python -m spacy download {SPACY_MODEL}")
             self.nlp = None
 
         self.query_types = {
@@ -1142,7 +1168,7 @@ class HybridRetrievalEngine:
     def __init__(self, vector_index: VectorIndexManager, kg_manager: KnowledgeGraphManager, embedding_service: EmbeddingService):
         self.vector_index = vector_index
         self.kg_manager = kg_manager
-        self.query_processor = QueryProcessor() # Corrected: Removed typo Query_Processor
+        self.query_processor = QueryProcessor()
         self.embedding_service = embedding_service # Use centralized embedding service
 
         # Cross-encoder for re-ranking (placeholder)
@@ -1453,6 +1479,7 @@ class ResponseGenerator:
 # =============================================================================
 
 class StorageManager:
+
     def __init__(self, data_path: Path, storage_path: Path):
         self.data_path = data_path
         self.storage_path = storage_path
@@ -1539,7 +1566,6 @@ class StorageManager:
         
         logger.warning("Incomplete or failed load of data structures. Will re-process data.")
         return False
-
 
 # =============================================================================
 # 10. MAIN RAG SYSTEM
