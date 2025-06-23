@@ -12,3 +12,4 @@ pandas
 tiktoken
 matplotlib
 sentence-transformers
+pypdf

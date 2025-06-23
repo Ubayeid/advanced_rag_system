@@ -1,3 +1,4 @@
+import pypdf
 import asyncio
 import json
 import numpy as np
@@ -24,6 +25,11 @@ from spacy.matcher import Matcher, PhraseMatcher
 # OpenAI & Sentence Transformers
 from openai import OpenAI, APIError
 from sentence_transformers import SentenceTransformer # This line is now active for Sentence Transformers
+
+import knowledge_graph
+
+# Plotly specific import for renderer control
+import plotly.io as pio
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -376,14 +382,31 @@ class DocumentProcessor:
         return chunks, entities, relations
 
     def _clean_text(self, content: str) -> str:
-        # Remove non-ASCII characters that often result from bad PDF OCR
-        content = re.sub(r'[^\x00-\x7F]+', ' ', content) # Remove non-ASCII characters
-        # Remove common PDF artifacts (e.g., multiple spaces, newlines, form feed)
+        # Initial cleanup: Remove non-ASCII and normalize whitespace aggressively
+        content = re.sub(r'[^\x00-\x7F]+', ' ', content)
         content = re.sub(r'\s+', ' ', content)
-        # Remove very short lines or common headers/footers if they are repetitive and non-content
-        # This part might need tuning per document type
-        # content = re.sub(r'Page \d+ of \d+', '', content, flags=re.IGNORECASE) # Example
-        # content = re.sub(r'CEUR-WS.org/Vol-\d+/\S+\.pdf', '', content) # Example from your doc
+
+        # Remove common PDF internal artifacts
+        # Regex for common PDF object/stream identifiers (e.g., "0000000015 00000 n")
+        content = re.sub(r'\b\d+\s+\d+\s+n\b|\b\d{9,}\s+\d{5,}\b', ' ', content)
+        # Remove timestamps (e.g., "D:20250619015147Z")
+        content = re.sub(r'D:\d{14}Z', ' ', content)
+        # Remove common page number patterns (e.g., "1 of 10", or just isolated page numbers like "2 4")
+        content = re.sub(r'\bPage \d+ of \d+\b|\b\d+\s+\d+\b', ' ', content, flags=re.IGNORECASE)
+        # Remove very short sequences that look like OCR errors or PDF junk (e.g., "kI", "jE", "OV")
+        # This is more precise: look for 2-3 char sequences that are NOT common English words
+        # This is hard to do with regex alone without a word list.
+        # For simple cases:
+        content = re.sub(r'\b[A-Za-z]{2,3}\b', ' ', content) # Removes short words, some might be valid.
+                                                            # Consider replacing with a list-based filter if this is too aggressive.
+
+        # Remove reference numbers like "[18][19]" or just standalone numbers that are unlikely to be meaningful entities.
+        content = re.sub(r'\[\d+\](\[\d+\])*', ' ', content) # Removes [18][19], [1], etc.
+        content = re.sub(r'\b\d+\.\d+\b', ' ', content) # Removes "2.2", "3.2", "4.3"
+
+        # After targeted removal, normalize whitespace again to clean up extra spaces left by substitutions
+        content = re.sub(r'\s+', ' ', content)
+
         return content.strip()
 
     def _create_chunks(self, content: str, doc_id: str) -> List[DocumentChunk]:
@@ -883,91 +906,91 @@ class VectorIndexManager:
 
 class KnowledgeGraphManager:
     def __init__(self):
-        self.graph = nx.MultiDiGraph() # Directed graph for relations
+        # THIS IS THE CRUCIAL LINE: Ensure it is nx.MultiDiGraph()
+        self.graph = nx.MultiDiGraph() 
         self.entities: Dict[str, KnowledgeEntity] = {}
         self.relations: Dict[str, KnowledgeRelation] = {}
         self.document_chunks: Dict[str, DocumentChunk] = {} # Store chunk objects for KG nodes (metadata only)
 
     def add_data(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity], relations: List[KnowledgeRelation]):
-            """Add entities, relations, and chunks to the graph."""
-            # Ensure ALL chunks are added as nodes with their metadata
-            for chunk in chunks:
-                if chunk.id not in self.document_chunks:
-                    self.document_chunks[chunk.id] = chunk
-                # Always add/update the node in the graph, ensuring properties are set
-                self.graph.add_node(chunk.id, type='CHUNK', content=chunk.content[:200] + '...', document_id=chunk.document_id, chunk_index=chunk.chunk_index)
+        """Add entities, relations, and chunks to the graph."""
+        # Ensure ALL chunks are added as nodes with their metadata
+        for chunk in chunks:
+            if chunk.id not in self.document_chunks:
+                self.document_chunks[chunk.id] = chunk
+            # Always add/update the node in the graph, ensuring properties are set
+            self.graph.add_node(chunk.id, type='CHUNK', content=chunk.content[:200] + '...', document_id=chunk.document_id, chunk_index=chunk.chunk_index)
 
 
-            # Ensure ALL entities are added as nodes with their metadata
-            for entity in entities:
-                if entity.id not in self.entities:
-                    self.entities[entity.id] = entity # Store the entity object
-                    # Add node to graph for this entity. Make sure properties are always set/updated.
-                    self.graph.add_node(entity.id, name=entity.name, type=entity.entity_type, document_ids=entity.document_ids, related_chunks=entity.related_chunks)
+        # Ensure ALL entities are added as nodes with their metadata
+        for entity in entities:
+            if entity.id not in self.entities:
+                self.entities[entity.id] = entity # Store the entity object
+                # Add node to graph for this entity. Make sure properties are always set/updated.
+                self.graph.add_node(entity.id, name=entity.name, type=entity.entity_type, document_ids=entity.document_ids, related_chunks=entity.related_chunks)
+            else:
+                # Update existing entity's attributes if it's already processed from another chunk/document
+                existing_entity = self.entities[entity.id]
+                existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
+                existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
+                # Update graph node attributes as well
+                self.graph.nodes[entity.id]['name'] = entity.name
+                self.graph.nodes[entity.id]['type'] = entity.entity_type # Ensure type is consistent
+                self.graph.nodes[entity.id]['document_ids'] = existing_entity.document_ids
+                self.graph.nodes[entity.id]['related_chunks'] = existing_entity.related_chunks
+
+        # Add MENTIONS relations between chunks and entities
+        for entity in entities: # Iterate over *all* entities identified
+            for chunk_id in entity.related_chunks:
+                # IMPORTANT: Ensure both the chunk node AND entity node are already in the graph
+                # from the loops above before trying to add an edge.
+                if chunk_id in self.graph and entity.id in self.graph:
+                    # For MultiDiGraph, you can simply add the edge with a key.
+                    # Use a composite key for MENTIONS to prevent duplicates if an entity is mentioned multiple times in the same chunk
+                    # or if the same entity has multiple relations to the same chunk (e.g. from different sentences if you ever add those).
+                    # For a simple MENTIONS relationship, (chunk_id, entity.id, 'MENTIONS') is usually unique enough.
+                    if self.graph.get_edge_data(chunk_id, entity.id) is None:
+                        self.graph.add_edge(chunk_id, entity.id, key='MENTIONS', relation_type='MENTIONS', confidence=1.0)
+                    if self.graph.get_edge_data(entity.id, chunk_id) is None: # Bi-directional for easier traversal
+                        self.graph.add_edge(entity.id, chunk_id, key='MENTIONED_IN', relation_type='MENTIONED_IN', confidence=1.0)
                 else:
-                    # Update existing entity's attributes if it's already processed from another chunk/document
-                    existing_entity = self.entities[entity.id]
-                    existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
-                    existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
-                    # Update graph node attributes as well
-                    self.graph.nodes[entity.id]['name'] = entity.name
-                    self.graph.nodes[entity.id]['type'] = entity.entity_type # Ensure type is consistent
-                    self.graph.nodes[entity.id]['document_ids'] = existing_entity.document_ids
-                    self.graph.nodes[entity.id]['related_chunks'] = existing_entity.related_chunks
+                    # These warnings are expected if entities or chunks were filtered out earlier (e.g., too short)
+                    logger.debug(f"Skipping MENTIONS relation: Chunk {chunk_id} or Entity {entity.id} not found in graph for direct linking.") # Changed to debug
 
+        # Add relations (between entities)
+        # Use a set to track already added relation tuples (source, target, type) for MultiDiGraph
+        # This prevents redundant edges of the *same type* between the same two entities.
+        added_relation_tuples = set()
 
-            # Add MENTIONS relations between chunks and entities
-            for entity in entities: # Iterate over *all* entities identified
-                for chunk_id in entity.related_chunks:
-                    # IMPORTANT: Ensure both the chunk node AND entity node are already in the graph
-                    # from the loops above before trying to add an edge.
-                    if chunk_id in self.graph and entity.id in self.graph:
-                        # Use a composite key for MENTIONS to prevent duplicates if an entity is mentioned multiple times in the same chunk
-                        # or if the same entity has multiple relations to the same chunk (e.g. from different sentences if you ever add those).
-                        # For a simple MENTIONS relationship, (chunk_id, entity.id, 'MENTIONS') is usually unique enough.
-                        if self.graph.get_edge_data(chunk_id, entity.id, key='MENTIONS') is None:
-                            self.graph.add_edge(chunk_id, entity.id, key='MENTIONS', relation_type='MENTIONS', confidence=1.0)
-                        if self.graph.get_edge_data(entity.id, chunk_id, key='MENTIONED_IN') is None: # Bi-directional for easier traversal
-                            self.graph.add_edge(entity.id, chunk_id, key='MENTIONED_IN', relation_type='MENTIONED_IN', confidence=1.0)
-                    else:
-                        # These warnings are expected if entities or chunks were filtered out earlier (e.g., too short)
-                        logger.debug(f"Skipping MENTIONS relation: Chunk {chunk_id} or Entity {entity.id} not found in graph for direct linking.") # Changed to debug
-
-
-            # Add relations (between entities)
-            # Use a set to track already added relation tuples (source, target, type) for MultiDiGraph
-            # This prevents redundant edges of the *same type* between the same two entities.
-            added_relation_tuples = set()
-
-            for relation in relations:
-                # Only add if both source and target entities exist in the graph and this specific relation type isn't duplicated
-                if relation.source_entity in self.graph and relation.target_entity in self.graph:
-                    relation_tuple = (relation.source_entity, relation.target_entity, relation.relation_type)
-                    if relation_tuple not in added_relation_tuples:
-                        # We store the original relation object in self.relations to keep its specific UUID.
-                        # Then add the edge to the graph using relation.id as the key to make each relation object a distinct edge.
-                        # This ensures the graph accurately reflects the number of relation *objects* found.
-                        if self.graph.get_edge_data(relation.source_entity, relation.target_entity, key=relation.id) is None: # Use relation.id as the edge key
-                            self.relations[relation.id] = relation # Store the relation object by its unique ID
-                            self.graph.add_edge(
-                                relation.source_entity,
-                                relation.target_entity,
-                                key=relation.id, # Use relation's unique ID as the edge key in MultiDiGraph
-                                relation_type=relation.relation_type,
-                                confidence=relation.confidence,
-                                document_id=relation.document_id,
-                                sentence=relation.sentence
-                            )
-                            added_relation_tuples.add(relation_tuple) # Track by (source, target, type) to avoid semantic duplication
-                    else:
-                        logger.debug(f"Skipping semantically duplicate relation type '{relation.relation_type}' between {relation.source_entity} and {relation.target_entity}.")
+        for relation in relations:
+            # Only add if both source and target entities exist in the graph and this specific relation type isn't duplicated
+            if relation.source_entity in self.graph and relation.target_entity in self.graph:
+                relation_tuple = (relation.source_entity, relation.target_entity, relation.relation_type)
+                if relation_tuple not in added_relation_tuples:
+                    # We store the original relation object in self.relations to keep its specific UUID.
+                    # Then add the edge to the graph using relation.id as the key to make each relation object a distinct edge.
+                    # This ensures the graph accurately reflects the number of relation *objects* found.
+                    if self.graph.get_edge_data(relation.source_entity, relation.target_entity, key=relation.id) is None: # Use relation.id as the edge key
+                        self.relations[relation.id] = relation # Store the relation object by its unique ID
+                        self.graph.add_edge(
+                            relation.source_entity,
+                            relation.target_entity,
+                            key=relation.id, # Use relation's unique ID as the edge key in MultiDiGraph
+                            relation_type=relation.relation_type,
+                            confidence=relation.confidence,
+                            document_id=relation.document_id,
+                            sentence=relation.sentence
+                        )
+                        added_relation_tuples.add(relation_tuple) # Track by (source, target, type) to avoid semantic duplication
                 else:
-                    logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph during relation addition.")
-            
-            # After adding all nodes and edges, log the actual graph counts
-            logger.info(f"KG Population Status: Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}.")
-            # Ensure this logger is after all additions
-            logger.info(f"Total entities stored: {len(self.entities)}, Total relations stored: {len(self.relations)}, Total document chunks stored: {len(self.document_chunks)}")
+                    logger.debug(f"Skipping semantically duplicate relation type '{relation.relation_type}' between {relation.source_entity} and {relation.target_entity}.")
+            else:
+                logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph during relation addition.")
+        
+        # After adding all nodes and edges, log the actual graph counts
+        logger.info(f"KG Population Status: Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}.")
+        # Ensure this logger is after all additions
+        logger.info(f"Total entities stored: {len(self.entities)}, Total relations stored: {len(self.relations)}, Total document chunks stored: {len(self.document_chunks)}")
 
     def get_related_info(self, query_entities: List[str], max_distance: int = 2) -> List[Dict[str, Any]]:
         """
@@ -1000,7 +1023,7 @@ class KnowledgeGraphManager:
 
                 if target_node not in seen_nodes:
                     node_data = self.graph.nodes[target_node]
-                    
+
                     # Calculate distance using shortest_path_length for accuracy from start_node_id
                     try:
                         distance = nx.shortest_path_length(self.graph, source=start_node_id, target=target_node)
@@ -1607,7 +1630,7 @@ class SimpleAdvancedRAGSystem:
         self.vector_index.index_to_id = {}
         self.vector_index.current_index = 0
 
-        self.kg_manager.graph = nx.DiGraph()
+        self.kg_manager.graph = nx.MultiDiGraph()
         self.kg_manager.entities = {}
         self.kg_manager.relations = {}
         self.kg_manager.document_chunks = {}
@@ -1649,13 +1672,34 @@ class SimpleAdvancedRAGSystem:
         documents = []
         for file_path in directory.iterdir():
             if file_path.is_file():
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
+                content = ""
+                if file_path.suffix.lower() == '.pdf':
+                    try:
+                        reader = pypdf.PdfReader(file_path)
+                        for page in reader.pages:
+                            # Extract text from each page and concatenate
+                            # Add a newline or space between page contents to maintain separation
+                            content += page.extract_text(0) + "\n"
+                        logger.info(f"Loaded PDF document: {file_path.name}")
+                        # Optional: Add the raw extracted text to logs for debugging (after pypdf extraction)
+                        # logger.info(f"PDF EXTRACTED TEXT (first 500 chars of {file_path.name}):\n{content[:500]}\n...")
+                    except Exception as e:
+                        logger.error(f"Could not read PDF {file_path} using pypdf: {e}")
+                        continue # Skip to next file if there's an error
+                elif file_path.suffix.lower() == '.txt':
+                    try:
+                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                        logger.info(f"Loaded TXT document: {file_path.name}")
+                    except Exception as e:
+                        logger.error(f"Could not read TXT {file_path}: {e}")
+                        continue
+                else:
+                    logger.warning(f"Unsupported file type: {file_path.suffix} for {file_path.name}. Skipping.")
+                    continue
+
+                if content: # Only append if content was successfully extracted
                     documents.append({'id': file_path.name, 'content': content})
-                    logger.info(f"Loaded document: {file_path.name}")
-                except Exception as e:
-                    logger.error(f"Could not read {file_path}: {e}")
         return documents
 
     def query(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
@@ -1721,34 +1765,65 @@ if __name__ == "__main__":
     # Initialize the knowledge base (loads from disk or re-processes)
     rag_system.initialize_knowledge_base()
     print("\nKnowledge Base Ready!")
+    sys.stdout.flush() # Added for better interactive output handling
 
     print(f"System Stats: {rag_system.get_system_stats()}\n")
+    sys.stdout.flush() # Added for better interactive output handling
 
-    print("Enter your query (type 'exit' to quit):")
+    # --- ADD THE CALL TO VISUALIZE AND ANALYZE THE GRAPH HERE ---
+    # print("Generating interactive knowledge graph visualization and gap report...")
+    # sys.stdout.flush()
+    # try:
+    #     # Call the function from your knowledge_graph module
+    #     analysis_results = knowledge_graph.analyze_rag_knowledge_graph(rag_system)
+    #     print("Knowledge graph visualization generated. Check your default web browser for interactive plot.")
+    #     print(f"Knowledge gap report saved to knowledge_gap_report.md and printed above.")
+    #     sys.stdout.flush()
+    # except Exception as e:
+    #     logger.error(f"Error during knowledge graph visualization/analysis: {e}")
+    #     print(f"An error occurred during graph visualization: {e}")
+    #     sys.stdout.flush()
+    # --- END OF GRAPH VISUALIZATION ADDITION ---
+
+    print("\nEnter your query (type 'exit' to quit):")
+    sys.stdout.flush() # Added for better interactive output handling
     while True:
         try:
             user_input = input("Query> ").strip()
+            sys.stdout.flush() # Crucial: Flush after input to clear input buffer echoes
+
             if user_input.lower() in ("exit", "quit"):
                 print("Exiting interactive RAG system. Goodbye!")
+                sys.stdout.flush()
                 break
             if not user_input:
                 continue
 
             query_result = rag_system.query(user_input)
             print("-" * 50)
+            sys.stdout.flush()
             print(f"Answer: {query_result['answer']}")
+            sys.stdout.flush()
             print(f"Confidence: {query_result['confidence']:.2f}")
+            sys.stdout.flush()
             print(f"Sources Used:")
+            sys.stdout.flush()
             for src in query_result['sources']:
                 print(f"  - Document: {src['document_id']} (Score: {src['score']:.2f})")
                 print(f"    Entities: {', '.join(src['entities_in_chunk']) if src['entities_in_chunk'] else 'None'}")
                 print(f"    Keywords: {', '.join(src['keywords_in_chunk']) if src['keywords_in_chunk'] else 'None'}")
+                sys.stdout.flush()
             print(f"Query Analysis: {query_result['query_analysis']}")
+            sys.stdout.flush()
             print("-" * 50 + "\n")
+            sys.stdout.flush()
+
         except (KeyboardInterrupt, EOFError):
             print("\nExiting interactive RAG system. Goodbye!")
+            sys.stdout.flush()
             break
         except Exception as e:
             logger.exception(f"An error occurred during interactive query loop: {e}")
             print(f"An unexpected error occurred: {e}")
+            sys.stdout.flush()
             continue
