@@ -47,7 +47,7 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384")) # Default dimension for a
 
 # LLM Model Configuration (for answer generation via OpenAI API)
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-3.5-turbo")
-LLM_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7")) # Renamed from OPENAI_TEMPERATURE
+LLM_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS_CONTEXT = int(os.getenv("LLM_MAX_TOKENS_CONTEXT", "4000")) # Max input tokens for LLM
 LLM_MAX_TOKENS_RESPONSE = int(os.getenv("LLM_MAX_TOKENS_RESPONSE", "1000")) # Max output tokens for LLM response
 
@@ -69,10 +69,10 @@ KG_GRAPH_PATH = STORAGE_PATH / "kg_graph.gml" # GML for NetworkX graph
 KG_ENTITIES_PATH = STORAGE_PATH / "kg_entities.json"
 KG_RELATIONS_PATH = STORAGE_PATH / "kg_relations.json"
 LAST_DATA_HASH_PATH = STORAGE_PATH / "data_hash.txt"
-KG_CHUNKS_PATH = STORAGE_PATH / "kg_chunks.json" # Defined explicitly for clarity
+KG_CHUNKS_PATH = STORAGE_PATH / "kg_chunks.json"
 
 # System Settings
-ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true" # Boolean from string
+ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true"
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "./cache"))
 MAX_CONCURRENT_REQUESTS = int(os.getenv("MAX_CONCURRENT_REQUESTS", "10"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "60"))
@@ -84,9 +84,9 @@ SPACY_MODEL = os.getenv("SPACY_MODEL", "en_core_web_sm")
 # Ensure storage and data directory exist
 STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 DATA_PATH.mkdir(parents=True, exist_ok=True)
-CACHE_DIR.mkdir(parents=True, exist_ok=True) # Ensure cache directory also exists
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# =============================================================================
+
 # 1. DATA STRUCTURES
 # =============================================================================
 
@@ -96,7 +96,7 @@ class DocumentChunk:
     document_id: str
     content: str
     chunk_index: int
-    embedding: Optional[np.ndarray] = None # Make optional for initial creation
+    embedding: Optional[np.ndarray] = None
     keywords: List[str] = field(default_factory=list)
     entities: List[Dict[str, Any]] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -145,12 +145,12 @@ class KnowledgeEntity:
 @dataclass
 class KnowledgeRelation:
     id: str
-    source_entity: str # ID of source entity
-    target_entity: str # ID of target entity
+    source_entity: str
+    target_entity: str
     relation_type: str
     confidence: float
-    document_id: Optional[str] = None # Document where relation was found
-    sentence: Optional[str] = None # Sentence from which relation was extracted
+    document_id: Optional[str] = None
+    sentence: Optional[str] = None
 
     def to_dict(self):
         return self.__dict__
@@ -159,7 +159,7 @@ class KnowledgeRelation:
     def from_dict(data: Dict[str, Any]):
         return KnowledgeRelation(**data)
 
-# =============================================================================
+
 # 2. UTILITY SERVICES (Embedding, etc.)
 # =============================================================================
 
@@ -243,21 +243,20 @@ class EmbeddingService:
             logger.error(f"Unknown embedding model type: {self.model_type}")
             return np.zeros(self.embedding_dim, dtype=np.float32)
 
-# =============================================================================
+
 # 3. DOCUMENT PROCESSOR
 # =============================================================================
 
 class DocumentProcessor:
     def __init__(self, embedding_service: EmbeddingService):
         self.embedding_service = embedding_service
-        # Access the tokenizer from the embedding service
-        self.tokenizer = embedding_service.tokenizer 
+        self.tokenizer = embedding_service.tokenizer
 
         try:
-            self.nlp = spacy.load(SPACY_MODEL) # Use SPACY_MODEL from .env
-            self.nlp.max_length = 2_000_000 # Increase max_length for larger documents
+            self.nlp = spacy.load(SPACY_MODEL)
+            self.nlp.max_length = 2_000_000
             self.matcher = Matcher(self.nlp.vocab)
-            self.phrase_matcher = PhraseMatcher(self.nlp.vocab) # Initialize PhraseMatcher
+            self.phrase_matcher = PhraseMatcher(self.nlp.vocab)
 
             # --- 1. Define Custom Hydrology Entity Types (Rule-Based) ---
             water_body_terms = [
@@ -350,25 +349,26 @@ class DocumentProcessor:
             self.matcher = None
             self.phrase_matcher = None
 
-        self.target_chunk_size_tokens = TARGET_CHUNK_SIZE_TOKENS 
-        self.chunk_overlap_sentences = CHUNK_OVERLAP_SENTENCES 
-        self.min_chunk_size_tokens = MIN_CHUNK_SIZE_TOKENS 
+        self.target_chunk_size_tokens = TARGET_CHUNK_SIZE_TOKENS
+        self.chunk_overlap_sentences = CHUNK_OVERLAP_SENTENCES
+        self.min_chunk_size_tokens = MIN_CHUNK_SIZE_TOKENS
 
         self.tfidf = TfidfVectorizer(max_features=100, stop_words='english')
 
     def process_document(self, document_id: str, content: str) -> Tuple[List[DocumentChunk], List[KnowledgeEntity], List[KnowledgeRelation]]:
         """Process document into chunks with entities and relations"""
+
         logger.info(f"Processing document: {document_id}")
         cleaned_content = self._clean_text(content)
 
         # Extract entities first
         entities = self._extract_entities(cleaned_content, document_id)
 
-        chunks = self._create_chunks(cleaned_content, document_id) 
+        chunks = self._create_chunks(cleaned_content, document_id)
 
         # Generate embeddings for each chunk
         for chunk in chunks:
-            chunk.embedding = self.embedding_service.get_embedding(chunk.content) # Use centralized service
+            chunk.embedding = self.embedding_service.get_embedding(chunk.content)
 
         # Extract keywords
         self._extract_keywords(chunks)
@@ -387,51 +387,46 @@ class DocumentProcessor:
         content = re.sub(r'\s+', ' ', content)
 
         # Remove common PDF internal artifacts
+
         # Regex for common PDF object/stream identifiers (e.g., "0000000015 00000 n")
         content = re.sub(r'\b\d+\s+\d+\s+n\b|\b\d{9,}\s+\d{5,}\b', ' ', content)
         # Remove timestamps (e.g., "D:20250619015147Z")
         content = re.sub(r'D:\d{14}Z', ' ', content)
         # Remove common page number patterns (e.g., "1 of 10", or just isolated page numbers like "2 4")
         content = re.sub(r'\bPage \d+ of \d+\b|\b\d+\s+\d+\b', ' ', content, flags=re.IGNORECASE)
-        # Remove very short sequences that look like OCR errors or PDF junk (e.g., "kI", "jE", "OV")
-        # This is more precise: look for 2-3 char sequences that are NOT common English words
-        # This is hard to do with regex alone without a word list.
-        # For simple cases:
-        content = re.sub(r'\b[A-Za-z]{2,3}\b', ' ', content) # Removes short words, some might be valid.
-                                                            # Consider replacing with a list-based filter if this is too aggressive.
 
+        # Remove very short sequences that look like OCR errors or PDF junk (e.g., "kI", "jE", "OV")
+
+        # This is more precise: look for 2-3 char sequences that are NOT common English words
+        content = re.sub(r'\b[A-Za-z]{2,3}\b', ' ', content) # Removes short words, some might be valid.
         # Remove reference numbers like "[18][19]" or just standalone numbers that are unlikely to be meaningful entities.
         content = re.sub(r'\[\d+\](\[\d+\])*', ' ', content) # Removes [18][19], [1], etc.
         content = re.sub(r'\b\d+\.\d+\b', ' ', content) # Removes "2.2", "3.2", "4.3"
-
         # After targeted removal, normalize whitespace again to clean up extra spaces left by substitutions
         content = re.sub(r'\s+', ' ', content)
 
         return content.strip()
 
     def _create_chunks(self, content: str, doc_id: str) -> List[DocumentChunk]:
-        """
-        Create overlapping chunks based on a recursive splitting strategy,
-        respecting token limits and minimum chunk size.
-        """
+        """ Create overlapping chunks based on a recursive splitting strategy, respecting token limits and minimum chunk size. """
         chunks = []
         chunk_index = 0
-        
+
         # Use the EMBEDDING_MODEL_MAX_TOKENS from the embedding service instance
         # This allows it to dynamically adapt to the actual max_seq_length of the loaded ST model.
-        EMBEDDING_MODEL_HARD_MAX_TOKENS = self.embedding_service.EMBEDDING_MODEL_MAX_TOKENS 
-        
+        EMBEDDING_MODEL_HARD_MAX_TOKENS = self.embedding_service.EMBEDDING_MODEL_MAX_TOKENS
+
         # A very safe fallback character split size, ensuring it's always smaller than the hard max.
         FALLBACK_CHAR_CHUNK_SIZE = int(EMBEDDING_MODEL_HARD_MAX_TOKENS * 0.9) # Leave a bit more buffer
 
-        separators = ["\n\n", "\n", ". ", "? ", "! ", " "] 
+        separators = ["\n\n", "\n", ". ", "? ", "! ", " "]
 
         def _split_recursively(text: str, current_separators: List[str]) -> List[str]:
             if not text:
                 return []
-            
+
             text_tokens = len(self.tokenizer.encode(text)) # Use LLM tokenizer for this count
-            
+
             # Base case: if text fits within TARGET_CHUNK_SIZE_TOKENS, return it
             if text_tokens <= self.target_chunk_size_tokens:
                 return [text]
@@ -443,7 +438,7 @@ class DocumentProcessor:
                 for i in range(0, len(text), FALLBACK_CHAR_CHUNK_SIZE):
                     sub_chunk = text[i:i + FALLBACK_CHAR_CHUNK_SIZE]
                     sub_chunks.append(sub_chunk)
-                    
+
                     # Log a warning if even after char splitting, a sub_chunk still exceeds the hard token limit
                     if len(self.tokenizer.encode(sub_chunk)) > EMBEDDING_MODEL_HARD_MAX_TOKENS:
                         logger.warning(f"Recursive char split produced a chunk of {len(self.tokenizer.encode(sub_chunk))} tokens, still exceeding {EMBEDDING_MODEL_HARD_MAX_TOKENS}. Document: {doc_id}. Consider reducing CHUNK_SIZE_TOKENS or checking source document. Snippet: {sub_chunk[:100]}...")
@@ -454,7 +449,7 @@ class DocumentProcessor:
             remaining_seps = current_separators[1:]
 
             split_parts = text.split(current_sep)
-            
+
             collected_chunks_from_recursion = []
             current_group_of_parts = []
             current_group_tokens = 0
@@ -474,10 +469,10 @@ class DocumentProcessor:
                         collected_chunks_from_recursion.extend(_split_recursively(
                             current_sep.join(current_group_of_parts), remaining_seps
                         ))
-                    
+
                     # The current 'part' itself might be too large, so recursively split it.
                     collected_chunks_from_recursion.extend(_split_recursively(part, remaining_seps))
-                    
+
                     # Reset collector for the next group
                     current_group_of_parts = []
                     current_group_tokens = 0
@@ -485,18 +480,18 @@ class DocumentProcessor:
                     # Add part to current group
                     current_group_of_parts.append(part)
                     current_group_tokens += part_tokens
-            
+
             # Process any remaining parts in the last group
             if current_group_of_parts:
                 collected_chunks_from_recursion.extend(_split_recursively(
                     current_sep.join(current_group_of_parts), remaining_seps
                 ))
-            
+
             return collected_chunks_from_recursion
 
         # Perform initial recursive split
         pre_overlap_chunks = _split_recursively(content, separators)
-        
+
         # Now, combine chunks with overlap, ensuring final chunk size constraint
         current_overlap_sentences_buffer = []
         current_combined_chunk_content = []
@@ -517,18 +512,18 @@ class DocumentProcessor:
                     if current_combined_chunk_content: # Ensure there's content to save
                         final_chunk_text = " ".join(current_combined_chunk_content)
                         final_chunk_tokens = len(self.tokenizer.encode(final_chunk_text))
-                        
+
                         if final_chunk_tokens >= self.min_chunk_size_tokens or not chunks:
-                             chunks.append(DocumentChunk(
+                            chunks.append(DocumentChunk(
                                 id=str(uuid.uuid4()),
                                 document_id=doc_id,
                                 content=final_chunk_text,
                                 chunk_index=chunk_index
                             ))
-                             chunk_index += 1
+                            chunk_index += 1
                         else:
                             logger.debug(f"Skipping chunk {chunk_index} from {doc_id} due to small size: {final_chunk_tokens} tokens.")
-                            
+
                     current_combined_chunk_content = list(current_overlap_sentences_buffer)
                     current_combined_chunk_content.append(sent)
                     current_combined_chunk_tokens = len(self.tokenizer.encode(" ".join(current_combined_chunk_content)))
@@ -543,7 +538,7 @@ class DocumentProcessor:
         if current_combined_chunk_content:
             final_chunk_text = " ".join(current_combined_chunk_content)
             final_chunk_tokens = len(self.tokenizer.encode(final_chunk_text))
-            
+
             if final_chunk_tokens > 0:
                 chunks.append(DocumentChunk(
                     id=str(uuid.uuid4()),
@@ -559,12 +554,13 @@ class DocumentProcessor:
 
     def _extract_entities(self, content: str, doc_id: str) -> List[KnowledgeEntity]:
         """Extract named entities using spaCy NER and custom PhraseMatcher rules."""
+
         entities = []
         if not self.nlp:
             return entities
 
         doc = self.nlp(content)
-        seen_entities = set() # To avoid duplicate entities with same name and type
+        seen_entities = set()
 
         # 1. Add entities found by spaCy's default NER
         for ent in doc.ents:
@@ -581,19 +577,17 @@ class DocumentProcessor:
                 )
                 entities.append(entity)
                 seen_entities.add(entity_key)
-        
+
         # 2. Add entities found by custom PhraseMatcher rules
-        if self.phrase_matcher: # Check if phrase_matcher was initialized successfully
+        if self.phrase_matcher:
             matches = self.phrase_matcher(doc)
             for match_id, start, end in matches:
                 span = doc[start:end]
-                # The entity type for PhraseMatcher comes from the `match_id` (rule name)
-                custom_entity_type = self.nlp.vocab.strings[match_id] 
-                
+                custom_entity_type = self.nlp.vocab.strings[match_id]
+
                 if len(span.text.strip()) < 2 or span.text.strip().isnumeric():
                     continue
-                
-                # Check if this custom entity (text + type) has already been seen (from NER or another custom rule)
+
                 entity_key = (span.text.lower(), custom_entity_type)
                 if entity_key not in seen_entities:
                     entity = KnowledgeEntity(
@@ -610,21 +604,21 @@ class DocumentProcessor:
 
     def _extract_keywords(self, chunks: List[DocumentChunk]):
         """Extract keywords using TF-IDF"""
+
         if not chunks:
             return
 
         try:
             texts = [chunk.content for chunk in chunks]
-            # Filter out empty strings from texts before fitting TF-IDF
             non_empty_texts = [t for t in texts if t.strip()]
 
             if not non_empty_texts:
                 logger.warning("No content in chunks for TF-IDF keyword extraction.")
-                for chunk in chunks: # Ensure keywords are empty if no content
+                for chunk in chunks:
                     chunk.keywords = []
                 return
 
-            self.tfidf.fit(non_empty_texts) # Fit only on non-empty texts
+            self.tfidf.fit(non_empty_texts)
             feature_names = self.tfidf.get_feature_names_out()
 
             for i, chunk in enumerate(chunks):
@@ -643,19 +637,16 @@ class DocumentProcessor:
 
     def _link_entities_to_chunks(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity]):
         """Link entities to chunks where they appear and add chunk IDs to entity.related_chunks."""
+
         entity_name_to_id = {ent.name.lower(): ent.id for ent in entities}
 
         for chunk in chunks:
             for ent_name_lower, ent_id in entity_name_to_id.items():
-                # Check for entity name (case-insensitive) in chunk content
                 if ent_name_lower in chunk.content.lower():
-                    # Find the actual entity object by ID to update its related_chunks
                     original_entity = next((e for e in entities if e.id == ent_id), None)
                     if original_entity:
-                        # Ensure no duplicate entries
                         if chunk.id not in original_entity.related_chunks:
                             original_entity.related_chunks.append(chunk.id)
-                        # Add entity metadata to chunk
                         if not any(e['id'] == ent_id for e in chunk.entities):
                             chunk.entities.append({
                                 'id': original_entity.id,
@@ -664,16 +655,14 @@ class DocumentProcessor:
                             })
 
     def _create_relations(self, entities: List[KnowledgeEntity], full_content: str, doc_id: str) -> List[KnowledgeRelation]:
-        """
-        Create relations using spaCy's dependency parser and rule-based patterns.
-        Falls back to co-occurrence if patterns don't match.
-        """
+        """ Create relations using spaCy's dependency parser and rule-based patterns. Falls back to co-occurrence if patterns don't match. """
+
         relations = []
         if not self.nlp or not self.matcher:
             return relations
 
         doc = self.nlp(full_content)
-        entity_map = {ent.name: ent for ent in entities} # Map name to entity object
+        entity_map = {ent.name: ent for ent in entities}
 
         # Rule-based extraction using spaCy Matcher
         matches = self.matcher(doc)
@@ -682,22 +671,18 @@ class DocumentProcessor:
             rule_name = self.nlp.vocab.strings[match_id]
 
             # Collect actual entities that are part of the original `entities` list
-            # and appear within the matched span
             span_entities_in_kg = []
             for ent_in_span in span.ents:
-                # Need to use entity_map to link span.ent.text back to original KnowledgeEntity objects
                 if ent_in_span.text in entity_map:
                     span_entities_in_kg.append(entity_map[ent_in_span.text])
 
-            # Ensure we have at least two identified entities from our `entities` list
             if len(span_entities_in_kg) >= 2:
-                # For simplicity, take the first two recognized entities in the span
                 source_ent = span_entities_in_kg[0]
                 target_ent = span_entities_in_kg[1]
 
-                if source_ent.id != target_ent.id: # Avoid self-loops
+                if source_ent.id != target_ent.id:
 
-                    relation_type = rule_name # Start with the rule name itself
+                    relation_type = rule_name
 
                     # Refine relation_type based on specific entity types involved
                     if rule_name == "FLOWS_INTO" and (source_ent.entity_type in ["WATER_BODY", "GPE"]) and \
@@ -725,13 +710,12 @@ class DocumentProcessor:
                         source_entity=source_ent.id,
                         target_entity=target_ent.id,
                         relation_type=relation_type,
-                        confidence=0.9, # High confidence for rule matches
+                        confidence=0.9,
                         document_id=doc_id,
-                        sentence=span.text # The sentence segment where the relation was found
+                        sentence=span.text
                     ))
 
         # Fallback to co-occurrence for entities in the same sentence if no specific rule applied
-        # This is less precise but captures broader relationships.
         extracted_relations_set = set([(r.source_entity, r.target_entity, r.relation_type) for r in relations])
 
         for sent in doc.sents:
@@ -740,14 +724,13 @@ class DocumentProcessor:
             for ent_in_sent in sent.ents:
                 if ent_in_sent.text in entity_map:
                     sent_entities.append(entity_map[ent_in_sent.text])
-            
-            # Also consider custom entities found by phrase_matcher within the sentence
+
             if self.phrase_matcher:
                 phrase_matches_in_sent = self.phrase_matcher(sent)
                 for match_id, start, end in phrase_matches_in_sent:
                     span_in_sent = sent.char_span(start, end)
                     if span_in_sent and span_in_sent.text in entity_map: # Check if this phrase is also a known entity
-                        if entity_map[span_in_sent.text] not in sent_entities: # Avoid adding duplicates
+                        if entity_map[span_in_sent.text] not in sent_entities:
                             sent_entities.append(entity_map[span_in_sent.text])
 
             if len(sent_entities) >= 2:
@@ -755,25 +738,20 @@ class DocumentProcessor:
                     for j, ent2 in enumerate(sent_entities):
                         if i < j: # Avoid self-loops and duplicate (A,B) and (B,A) pairs
                             # Check if a specific or CO_OCCURS relation already exists for this pair
-                            # Order is important for the set, so check both directions for undirected co-occurrence concept
-                            if (ent1.id, ent2.id, 'CO_OCCURS') not in extracted_relations_set and \
-                               (ent2.id, ent1.id, 'CO_OCCURS') not in extracted_relations_set:
-                                
+                            if (ent1.id, ent2.id, 'CO_OCCURS') not in extracted_relations_set and (ent2.id, ent1.id, 'CO_OCCURS') not in extracted_relations_set:
                                 # Check if a more specific relation already exists between these two entities
                                 specific_relation_exists = False
                                 for r_check in extracted_relations_set:
-                                    if (r_check[0] == ent1.id and r_check[1] == ent2.id) or \
-                                       (r_check[0] == ent2.id and r_check[1] == ent1.id):
+                                    if (r_check[0] == ent1.id and r_check[1] == ent2.id) or (r_check[0] == ent2.id and r_check[1] == ent1.id):
                                         specific_relation_exists = True
                                         break
-                                
                                 if not specific_relation_exists:
                                     relation = KnowledgeRelation(
                                         id=str(uuid.uuid4()),
                                         source_entity=ent1.id,
                                         target_entity=ent2.id,
                                         relation_type='CO_OCCURS',
-                                        confidence=0.5, # Lower confidence for co-occurrence
+                                        confidence=0.5,
                                         document_id=doc_id,
                                         sentence=sent.text
                                     )
@@ -781,14 +759,14 @@ class DocumentProcessor:
                                     extracted_relations_set.add((relation.source_entity, relation.target_entity, relation.relation_type))
         return relations
 
-# =============================================================================
+
 # 4. VECTOR INDEX MANAGER
 # =============================================================================
 
 class VectorIndexManager:
     def __init__(self, embedding_dim: int = EMBEDDING_DIM):
         self.embedding_dim = embedding_dim
-        self.index: Optional[faiss.IndexFlatIP] = None # Initialize as None
+        self.index: Optional[faiss.IndexFlatIP] = None
         self.chunk_metadata: Dict[str, Any] = {} # Stores serialized chunk data
         self.id_to_index: Dict[str, int] = {}
         self.index_to_id: Dict[int, str] = {}
@@ -802,24 +780,20 @@ class VectorIndexManager:
         """Add chunks to vector index"""
         if not chunks:
             return
-        
+
         embeddings_to_add = []
         for chunk in chunks:
             if chunk.embedding is not None and chunk.id not in self.id_to_index: # Only add new chunks
                 embeddings_to_add.append(chunk.embedding)
-                
                 # Store metadata
-                self.chunk_metadata[chunk.id] = chunk.to_dict() # Use to_dict for serialization
-                
+                self.chunk_metadata[chunk.id] = chunk.to_dict()
                 # Store mappings
                 self.id_to_index[chunk.id] = self.current_index
                 self.index_to_id[self.current_index] = chunk.id
                 self.current_index += 1
             elif chunk.id in self.id_to_index:
                 # Update existing chunk metadata if content might have changed (though in this flow, it's new docs)
-                # Note: If embeddings change for an existing chunk, you'd need to remove and re-add from FAISS
                 self.chunk_metadata[chunk.id] = chunk.to_dict()
-
         if embeddings_to_add:
             embeddings_array = np.array(embeddings_to_add).astype('float32')
             self.index.add(embeddings_array)
@@ -830,16 +804,16 @@ class VectorIndexManager:
         if self.index.ntotal == 0:
             logger.warning("FAISS index is empty. No search results.")
             return []
-        
+
         query_embedding = np.array([query_embedding]).astype('float32')
         distances, indices = self.index.search(query_embedding, min(k, self.index.ntotal))
-        
+
         results = []
         for dist, idx in zip(distances[0], indices[0]):
             if idx in self.index_to_id:
                 chunk_id = self.index_to_id[idx]
                 chunk_dict = self.chunk_metadata.get(chunk_id, {})
-                
+
                 if chunk_dict:
                     # For search results, dict is fine to avoid unnecessary object creation
                     result_item = {
@@ -855,7 +829,7 @@ class VectorIndexManager:
                     logger.warning(f"Index {idx} not found in chunk_metadata for chunk_id {chunk_id}. Data inconsistency.")
             else:
                 logger.warning(f"Index {idx} not found in index_to_id mapping. Data inconsistency.")
-        
+
         return results
 
     def save_index(self):
@@ -867,7 +841,6 @@ class VectorIndexManager:
             with open(ID_TO_INDEX_PATH, 'w', encoding='utf-8') as f:
                 json.dump(self.id_to_index, f, indent=2)
             with open(INDEX_TO_ID_PATH, 'w', encoding='utf-8') as f:
-                # Convert int keys to str for JSON serialization
                 json.dump({str(k): v for k, v in self.index_to_id.items()}, f, indent=2)
             logger.info("FAISS index and metadata saved.")
             return True
@@ -886,117 +859,89 @@ class VectorIndexManager:
                 with open(ID_TO_INDEX_PATH, 'r', encoding='utf-8') as f:
                     self.id_to_index = json.load(f)
                 with open(INDEX_TO_ID_PATH, 'r', encoding='utf-8') as f:
-                    # Convert str keys back to int
                     self.index_to_id = {int(k): v for k, v in json.load(f).items()}
-                
                 self.current_index = self.index.ntotal
                 logger.info(f"FAISS index and metadata loaded. Total items: {self.index.ntotal}")
                 return True
             except Exception as e:
                 logger.error(f"Error loading FAISS index, restarting from scratch: {e}")
-                self._initialize_index() # Re-initialize if load fails
+                self._initialize_index()
                 return False
         logger.info("No existing FAISS index found. Starting fresh.")
         return False
 
 
-# =============================================================================
+
 # 5. KNOWLEDGE GRAPH MANAGER
 # =============================================================================
 
 class KnowledgeGraphManager:
     def __init__(self):
-        # THIS IS THE CRUCIAL LINE: Ensure it is nx.MultiDiGraph()
-        self.graph = nx.MultiDiGraph() 
+        self.graph = nx.MultiDiGraph()
         self.entities: Dict[str, KnowledgeEntity] = {}
         self.relations: Dict[str, KnowledgeRelation] = {}
-        self.document_chunks: Dict[str, DocumentChunk] = {} # Store chunk objects for KG nodes (metadata only)
+        self.document_chunks: Dict[str, DocumentChunk] = {}
 
     def add_data(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity], relations: List[KnowledgeRelation]):
         """Add entities, relations, and chunks to the graph."""
-        # Ensure ALL chunks are added as nodes with their metadata
+
         for chunk in chunks:
             if chunk.id not in self.document_chunks:
                 self.document_chunks[chunk.id] = chunk
-            # Always add/update the node in the graph, ensuring properties are set
             self.graph.add_node(chunk.id, type='CHUNK', content=chunk.content[:200] + '...', document_id=chunk.document_id, chunk_index=chunk.chunk_index)
 
-
-        # Ensure ALL entities are added as nodes with their metadata
         for entity in entities:
             if entity.id not in self.entities:
-                self.entities[entity.id] = entity # Store the entity object
-                # Add node to graph for this entity. Make sure properties are always set/updated.
+                self.entities[entity.id] = entity
                 self.graph.add_node(entity.id, name=entity.name, type=entity.entity_type, document_ids=entity.document_ids, related_chunks=entity.related_chunks)
             else:
-                # Update existing entity's attributes if it's already processed from another chunk/document
                 existing_entity = self.entities[entity.id]
                 existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
                 existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
-                # Update graph node attributes as well
                 self.graph.nodes[entity.id]['name'] = entity.name
-                self.graph.nodes[entity.id]['type'] = entity.entity_type # Ensure type is consistent
+                self.graph.nodes[entity.id]['type'] = entity.entity_type
                 self.graph.nodes[entity.id]['document_ids'] = existing_entity.document_ids
                 self.graph.nodes[entity.id]['related_chunks'] = existing_entity.related_chunks
 
-        # Add MENTIONS relations between chunks and entities
-        for entity in entities: # Iterate over *all* entities identified
+        for entity in entities:
             for chunk_id in entity.related_chunks:
-                # IMPORTANT: Ensure both the chunk node AND entity node are already in the graph
-                # from the loops above before trying to add an edge.
                 if chunk_id in self.graph and entity.id in self.graph:
-                    # For MultiDiGraph, you can simply add the edge with a key.
-                    # Use a composite key for MENTIONS to prevent duplicates if an entity is mentioned multiple times in the same chunk
-                    # or if the same entity has multiple relations to the same chunk (e.g. from different sentences if you ever add those).
-                    # For a simple MENTIONS relationship, (chunk_id, entity.id, 'MENTIONS') is usually unique enough.
                     if self.graph.get_edge_data(chunk_id, entity.id) is None:
                         self.graph.add_edge(chunk_id, entity.id, key='MENTIONS', relation_type='MENTIONS', confidence=1.0)
-                    if self.graph.get_edge_data(entity.id, chunk_id) is None: # Bi-directional for easier traversal
+                    if self.graph.get_edge_data(entity.id, chunk_id) is None:
                         self.graph.add_edge(entity.id, chunk_id, key='MENTIONED_IN', relation_type='MENTIONED_IN', confidence=1.0)
                 else:
-                    # These warnings are expected if entities or chunks were filtered out earlier (e.g., too short)
-                    logger.debug(f"Skipping MENTIONS relation: Chunk {chunk_id} or Entity {entity.id} not found in graph for direct linking.") # Changed to debug
+                    logger.debug(f"Skipping MENTIONS relation: Chunk {chunk_id} or Entity {entity.id} not found in graph for direct linking.")
 
         # Add relations (between entities)
-        # Use a set to track already added relation tuples (source, target, type) for MultiDiGraph
-        # This prevents redundant edges of the *same type* between the same two entities.
         added_relation_tuples = set()
 
         for relation in relations:
-            # Only add if both source and target entities exist in the graph and this specific relation type isn't duplicated
             if relation.source_entity in self.graph and relation.target_entity in self.graph:
                 relation_tuple = (relation.source_entity, relation.target_entity, relation.relation_type)
                 if relation_tuple not in added_relation_tuples:
-                    # We store the original relation object in self.relations to keep its specific UUID.
-                    # Then add the edge to the graph using relation.id as the key to make each relation object a distinct edge.
-                    # This ensures the graph accurately reflects the number of relation *objects* found.
-                    if self.graph.get_edge_data(relation.source_entity, relation.target_entity, key=relation.id) is None: # Use relation.id as the edge key
-                        self.relations[relation.id] = relation # Store the relation object by its unique ID
+                    if self.graph.get_edge_data(relation.source_entity, relation.target_entity, key=relation.id) is None:
+                        self.relations[relation.id] = relation
                         self.graph.add_edge(
                             relation.source_entity,
                             relation.target_entity,
-                            key=relation.id, # Use relation's unique ID as the edge key in MultiDiGraph
+                            key=relation.id,
                             relation_type=relation.relation_type,
                             confidence=relation.confidence,
                             document_id=relation.document_id,
                             sentence=relation.sentence
                         )
-                        added_relation_tuples.add(relation_tuple) # Track by (source, target, type) to avoid semantic duplication
+                        added_relation_tuples.add(relation_tuple)
                 else:
                     logger.debug(f"Skipping semantically duplicate relation type '{relation.relation_type}' between {relation.source_entity} and {relation.target_entity}.")
             else:
                 logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph during relation addition.")
-        
-        # After adding all nodes and edges, log the actual graph counts
+
         logger.info(f"KG Population Status: Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}.")
-        # Ensure this logger is after all additions
         logger.info(f"Total entities stored: {len(self.entities)}, Total relations stored: {len(self.relations)}, Total document chunks stored: {len(self.document_chunks)}")
 
     def get_related_info(self, query_entities: List[str], max_distance: int = 2) -> List[Dict[str, Any]]:
-        """
-        Get entities and related chunks connected to the given query entities,
-        traversing the knowledge graph.
-        """
+        """ Get entities and related chunks connected to the given query entities, traversing the knowledge graph. """
         related_info = []
         seen_nodes = set()
 
@@ -1007,7 +952,6 @@ class KnowledgeGraphManager:
                 if entity_obj.name.lower() == q_ent_name.lower():
                     query_entity_ids.append(eid)
                     break
-
         if not query_entity_ids:
             return []
 
@@ -1016,19 +960,16 @@ class KnowledgeGraphManager:
                 continue
 
             # BFS to find nodes within max_distance
-            # Use nx.shortest_path.shortest_path_length to get distance without recomputing path
             for target_node in nx.bfs_tree(self.graph, start_node_id, depth_limit=max_distance).nodes():
-                if target_node == start_node_id: # Skip the start node itself for related info
+                if target_node == start_node_id:
                     continue
 
                 if target_node not in seen_nodes:
                     node_data = self.graph.nodes[target_node]
-
-                    # Calculate distance using shortest_path_length for accuracy from start_node_id
                     try:
                         distance = nx.shortest_path_length(self.graph, source=start_node_id, target=target_node)
                     except nx.NetworkXNoPath:
-                        continue # Should not happen with bfs_tree, but as a safeguard
+                        continue
 
                     info_item = {
                         'id': target_node,
@@ -1042,30 +983,25 @@ class KnowledgeGraphManager:
                             info_item['content_snippet'] = chunk_obj.content[:200] + "..."
                             info_item['document_id'] = chunk_obj.document_id
                         else:
-                            info_item['content_snippet'] = node_data.get('content', '') # Fallback to snippet stored in graph
+                            info_item['content_snippet'] = node_data.get('content', '')
                             info_item['document_id'] = "UNKNOWN"
                     elif node_data.get('type') in ['PERSON', 'ORG', 'GPE', 'NORP', 'FAC', 'LOCATION', 'PRODUCT', 'EVENT', 'WORK_OF_ART', 'LAW', 'LANGUAGE', 'DATE', 'TIME', 'PERCENT', 'MONEY', 'QUANTITY', 'ORDINAL', 'CARDINAL', 'STUDY', 'WATER_BODY', 'HYDRO_MEASUREMENT', 'POLLUTANT', 'HYDRO_EVENT', 'HYDRO_INFRASTRUCTURE', 'HYDRO_MODEL']:
                         info_item['name'] = node_data.get('name')
-                        # Find the connecting edge data if there's a direct edge from source to target
                         if self.graph.has_edge(start_node_id, target_node):
                             connecting_edge_data = self.graph.get_edge_data(start_node_id, target_node)
-                            if connecting_edge_data: # Could have multiple edges, just take one
-                                first_edge_key = list(connecting_edge_data.keys())[0] # Get first edge key if multi-edge
+                            if connecting_edge_data:
+                                first_edge_key = list(connecting_edge_data.keys())[0]
                                 edge_attrs = connecting_edge_data[first_edge_key] if isinstance(connecting_edge_data, dict) else connecting_edge_data
                                 info_item['connection_type'] = edge_attrs.get('relation_type', 'unknown')
                                 info_item['connection_confidence'] = edge_attrs.get('confidence', 0.0)
-                        # else: # Handle other potential spaCy entity types dynamically - This path is already covered by the list check above
-                            # info_item['name'] = node_data.get('name', 'N/A')
-
                     related_info.append(info_item)
                     seen_nodes.add(target_node)
-
         return related_info
 
     def save_graph(self) -> bool:
         """Saves the NetworkX graph and associated entity/relation data."""
         try:
-            nx.write_gml(self.graph, str(KG_GRAPH_PATH)) # GML is a good format for NetworkX
+            nx.write_gml(self.graph, str(KG_GRAPH_PATH))
 
             with open(KG_ENTITIES_PATH, 'w', encoding='utf-8') as f:
                 json.dump({eid: entity.to_dict() for eid, entity in self.entities.items()}, f, indent=2)
@@ -1076,7 +1012,7 @@ class KnowledgeGraphManager:
             chunks_to_save = {cid: chunk.to_dict() for cid, chunk in self.document_chunks.items()}
             for cid in chunks_to_save:
                 if 'embedding' in chunks_to_save[cid]:
-                    chunks_to_save[cid]['embedding'] = None # Don't save embeddings here
+                    chunks_to_save[cid]['embedding'] = None
             with open(KG_CHUNKS_PATH, 'w', encoding='utf-8') as f:
                 json.dump(chunks_to_save, f, indent=2)
 
@@ -1088,6 +1024,7 @@ class KnowledgeGraphManager:
 
     def load_graph(self) -> bool:
         """Loads the NetworkX graph and associated entity/relation data."""
+
         if (KG_GRAPH_PATH.exists() and KG_ENTITIES_PATH.exists() and
             KG_RELATIONS_PATH.exists() and KG_CHUNKS_PATH.exists()):
             try:
@@ -1104,13 +1041,13 @@ class KnowledgeGraphManager:
                 return True
             except Exception as e:
                 logger.error(f"Error loading Knowledge Graph, restarting from scratch: {e}")
-                self.graph = nx.DiGraph() # Re-initialize if load fails
+                self.graph = nx.DiGraph()
                 return False
         logger.info("No existing Knowledge Graph found. Starting fresh.")
         return False
 
 
-# =============================================================================
+
 # 6. QUERY PROCESSOR
 # =============================================================================
 
@@ -1131,9 +1068,9 @@ class QueryProcessor:
         }
         self.stop_words = self.nlp.Defaults.stop_words if self.nlp else set()
 
-
     def analyze_query(self, query: str) -> Dict[str, Any]:
         """Analyze query to understand intent and extract entities/keywords."""
+
         query_lower = query.lower()
         doc = self.nlp(query) if self.nlp else None
 
@@ -1148,7 +1085,7 @@ class QueryProcessor:
         keywords = []
         if doc:
             keywords = [token.lemma_ for token in doc if token.is_alpha and not token.is_stop and not token.is_punct and len(token.lemma_) > 2]
-            keywords = list(set(keywords)) # Remove duplicates
+            keywords = list(set(keywords))
 
         # Extract entities using spaCy's NER
         entities = []
@@ -1156,9 +1093,6 @@ class QueryProcessor:
             for ent in doc.ents:
                 entities.append({'text': ent.text, 'label': ent.label_})
 
-        # Conceptual Entity Resolution/Linking (Placeholder)
-        # For now, we'll just use the extracted text.
-        # Include custom entity types in the extracted list as well if they are relevant for KG search
         extracted_entity_names = [e['text'] for e in entities if e['label'] in ['PERSON', 'ORG', 'GPE', 'NORP', 'FAC', 'STUDY', 'WATER_BODY', 'HYDRO_MEASUREMENT', 'POLLUTANT', 'HYDRO_EVENT', 'HYDRO_INFRASTRUCTURE', 'HYDRO_MODEL']]
 
         return {
@@ -1170,20 +1104,16 @@ class QueryProcessor:
         }
 
     def _resolve_entities(self, entities: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Placeholder for entity resolution/linking.
-        This would typically involve calling an external service or a more complex model
-        to link entities to canonical IDs (e.g., Wikidata, DBpedia).
-        """
+        """ Placeholder for entity resolution/linking. This would typically involve calling an external service or a more complex model to link entities to canonical IDs (e.g., Wikidata, DBpedia). """
+
         resolved = []
         for ent in entities:
-            # Mock resolution: just return original for now
             resolved_ent = ent.copy()
-            resolved_ent['canonical_id'] = None # Or some mock ID
+            resolved_ent['canonical_id'] = None
             resolved.append(resolved_ent)
         return resolved
 
-# =============================================================================
+
 # 7. HYBRID RETRIEVAL ENGINE
 # =============================================================================
 
@@ -1192,21 +1122,19 @@ class HybridRetrievalEngine:
         self.vector_index = vector_index
         self.kg_manager = kg_manager
         self.query_processor = QueryProcessor()
-        self.embedding_service = embedding_service # Use centralized embedding service
+        self.embedding_service = embedding_service
 
-        # Cross-encoder for re-ranking (placeholder)
-        # In a real scenario, load a specific cross-encoder model
-        # self.cross_encoder = SentenceTransformer('cross-encoder/ms-marco-MiniLM-L-6-v2')
-        self.cross_encoder = None # For now, just use mock
+        self.cross_encoder = None
 
     def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Hybrid retrieval combining vector search and knowledge graph, with re-ranking."""
+
         query_analysis = self.query_processor.analyze_query(query)
 
-        query_embedding = self.embedding_service.get_embedding(query) # Use centralized service
+        query_embedding = self.embedding_service.get_embedding(query)
 
         # 1. Initial Vector Search (Retrieve more candidates than final top_k)
-        vector_candidates = self.vector_index.search(query_embedding, top_k * 5) # Retrieve more for re-ranking
+        vector_candidates = self.vector_index.search(query_embedding, top_k * 5)
 
         # 2. Knowledge Graph Enhancement
         kg_related_info = self.kg_manager.get_related_info(query_analysis.get('entities', []))
@@ -1215,7 +1143,6 @@ class HybridRetrievalEngine:
         enhanced_candidates = self._enhance_and_boost_candidates(vector_candidates, query_analysis, kg_related_info)
 
         # Add KG-derived chunks as candidates if they are not already in vector_candidates
-        # This prevents completely isolated but relevant KG info from being missed
         kg_chunk_candidates = []
         existing_candidate_chunk_ids = {c['chunk_id'] for c in enhanced_candidates}
 
@@ -1223,21 +1150,19 @@ class HybridRetrievalEngine:
             if item['type'] == 'CHUNK':
                 chunk_id = item['id']
                 if chunk_id not in existing_candidate_chunk_ids:
-                    # Fetch full chunk data from vector_index.chunk_metadata
                     chunk_data = self.vector_index.chunk_metadata.get(chunk_id)
                     if chunk_data:
-                        # Assign a score based on KG distance, lower distance = higher score
-                        # 1.0 for distance 1, 0.5 for distance 2 etc.
-                        kg_score = max(0.1, 1.0 - (item['distance_from_query_entity'] * 0.2)) 
+                        # Assign a score based on KG distance, lower distance = higher score; 1.0 for distance 1, 0.5 for distance 2 etc.
+                        kg_score = max(0.1, 1.0 - (item['distance_from_query_entity'] * 0.2))
                         kg_chunk_candidates.append({
                             'chunk_id': chunk_id,
-                            'similarity_score': kg_score, 
+                            'similarity_score': kg_score,
                             'content': chunk_data.get('content', ''),
                             'document_id': chunk_data.get('document_id', ''),
                             'keywords': chunk_data.get('keywords', []),
                             'entities': chunk_data.get('entities', [])
                         })
-                        existing_candidate_chunk_ids.add(chunk_id) # Add to seen list
+                        existing_candidate_chunk_ids.add(chunk_id)
 
         enhanced_candidates.extend(kg_chunk_candidates)
 
@@ -1247,9 +1172,8 @@ class HybridRetrievalEngine:
         return final_results[:top_k]
 
     def _enhance_and_boost_candidates(self, candidates: List[Dict[str, Any]], query_analysis: Dict[str, Any], kg_related_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Enhance and boost scores of candidates based on KG relatedness and keyword overlap.
-        """
+        """ Enhance and boost scores of candidates based on KG relatedness and keyword overlap. """
+
         enhanced_results = []
         query_entities = [e.lower() for e in query_analysis.get('entities', [])]
         query_keywords = [kw.lower() for kw in query_analysis.get('keywords', [])]
@@ -1262,7 +1186,7 @@ class HybridRetrievalEngine:
             doc_entities = [e.get('name', '').lower() for e in result.get('entities', [])]
             entity_overlap_count = len(set(query_entities) & set(doc_entities))
             if entity_overlap_count > 0:
-                initial_score *= (1 + entity_overlap_count * 0.2) # Adjusted boost
+                initial_score *= (1 + entity_overlap_count * 0.2)
 
             # --- Boost based on direct keyword matches ---
             content_lower = result.get('content', '').lower()
@@ -1273,7 +1197,7 @@ class HybridRetrievalEngine:
             total_keyword_matches = keyword_content_matches + keyword_tag_matches
 
             if total_keyword_matches > 0:
-                initial_score *= (1 + total_keyword_matches * 0.05) # Adjusted boost
+                initial_score *= (1 + total_keyword_matches * 0.05)
 
             # --- Boost based on KG related chunks/entities (if a chunk itself is KG-related) ---
             is_kg_related = False
@@ -1281,13 +1205,11 @@ class HybridRetrievalEngine:
                 if kg_item['type'] == 'CHUNK' and kg_item['id'] == result['chunk_id']:
                     is_kg_related = True
                     break
-                # Also check if any entity within this chunk is directly related in the KG
                 if kg_item['type'] != 'CHUNK' and any(e['id'] == kg_item['id'] for e in result.get('entities', [])):
                     is_kg_related = True
                     break
-
             if is_kg_related:
-                initial_score *= 1.1 # Small boost for KG relevance
+                initial_score *= 1.1
 
             enhanced_result['similarity_score'] = initial_score
             enhanced_results.append(enhanced_result)
@@ -1295,10 +1217,8 @@ class HybridRetrievalEngine:
         return enhanced_results
 
     def _rank_results(self, results: List[Dict[str, Any]], query_analysis: Dict[str, Any], query_text: str) -> List[Dict[str, Any]]:
-        """
-        Final ranking of results, potentially using a cross-encoder for re-scoring.
-        Applies diversity filtering.
-        """
+        """  Final ranking of results, potentially using a cross-encoder for re-scoring. Applies diversity filtering.  """
+
         # First sort by the enhanced similarity score
         results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
 
@@ -1307,7 +1227,7 @@ class HybridRetrievalEngine:
             sentence_pairs = [(query_text, r['content']) for r in results]
             try:
                 # actual_scores = self.cross_encoder.predict(sentence_pairs)
-                actual_scores = np.random.rand(len(results)) * 0.5 + 0.5 # Mock scores between 0.5 and 1.0
+                actual_scores = np.random.rand(len(results)) * 0.5 + 0.5
                 for i, score in enumerate(actual_scores):
                     results[i]['similarity_score'] = (results[i]['similarity_score'] + score) / 2
                 results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
@@ -1318,13 +1238,13 @@ class HybridRetrievalEngine:
         # Apply diversity filter to ensure variety of source documents
         diverse_results = []
         seen_document_ids = set()
-        seen_chunk_ids = set() # To track actual chunks added
+        seen_chunk_ids = set()
 
         for result in results:
             doc_id = result.get('document_id')
             chunk_id = result.get('chunk_id')
 
-            if chunk_id in seen_chunk_ids: # Skip if this exact chunk has been added
+            if chunk_id in seen_chunk_ids:
                 continue
 
             if doc_id not in seen_document_ids:
@@ -1332,27 +1252,14 @@ class HybridRetrievalEngine:
                 seen_document_ids.add(doc_id)
                 seen_chunk_ids.add(chunk_id)
             else:
-                # If document is already seen, only add if significantly better score,
-                # or if we still need more results to hit target k, and it's a different chunk
-                # Re-evaluate logic to allow *some* additional chunks from same document if highly relevant
-                # For simplicity here, we add it if its score is very high (e.g., top 20% of its doc's max score)
-                # This could be improved with Maximum Marginal Relevance (MMR) or explicit reranking by document.
-                
                 # Find the max score for this document already in diverse_results
                 max_score_for_doc = next((d['similarity_score'] for d in diverse_results if d['document_id'] == doc_id), 0)
-                
-                # Allow more chunks from the same document if they are significantly high scoring
-                # and we haven't filled up all top_k slots with diverse documents yet.
-                # Threshold of 0.9 * max_score_for_doc and limited to not exceed 2 chunks per doc initially.
-                # This is a heuristic and can be tuned.
                 chunks_from_this_doc_in_diverse = sum(1 for r in diverse_results if r['document_id'] == doc_id)
 
-                if result.get('similarity_score', 0) >= 0.9 * max_score_for_doc and \
-                   chunks_from_this_doc_in_diverse < 2: # Limit additional chunks from same doc
+                if result.get('similarity_score', 0) >= 0.9 * max_score_for_doc and chunks_from_this_doc_in_diverse < 2:
                     diverse_results.append(result)
-                    seen_chunk_ids.add(chunk_id) # Mark this specific chunk as seen
+                    seen_chunk_ids.add(chunk_id)
 
-        # Ensure we return at least top_k results if available, even if some are duplicates after initial diversity filter
         # This fills up the ranks using the initial sorted list if the diverse_results fall short of top_k.
         final_selected_results = []
         final_seen_chunk_ids = set()
@@ -1362,22 +1269,20 @@ class HybridRetrievalEngine:
             if r['chunk_id'] not in final_seen_chunk_ids:
                 final_selected_results.append(r)
                 final_seen_chunk_ids.add(r['chunk_id'])
-        
-        # Then fill remaining spots from the original sorted results (which might re-introduce less diverse but high-scoring chunks)
+
         # This ensures we meet `top_k` if enough candidates exist.
         for r in results:
-            if len(final_selected_results) >= len(results): # Cap at total available
+            if len(final_selected_results) >= len(results):
                 break
             if r['chunk_id'] not in final_seen_chunk_ids:
                 final_selected_results.append(r)
                 final_seen_chunk_ids.add(r['chunk_id'])
 
-
         # Final sort after diversity for good measure (important for RRF type merging if applied)
         final_selected_results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
         return final_selected_results
 
-# =============================================================================
+
 # 8. RESPONSE GENERATOR
 # =============================================================================
 
@@ -1387,7 +1292,7 @@ class ResponseGenerator:
             api_key=os.getenv("OPENAI_API_KEY"),
         )
         self.llm_model = LLM_MODEL_NAME
-        self.tokenizer = tiktoken.encoding_for_model(self.llm_model) # Initialize tokenizer
+        self.tokenizer = tiktoken.encoding_for_model(self.llm_model)
 
     def generate_response(self, query: str, retrieved_chunks: List[Dict[str, Any]], query_analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Generate response from retrieved information using an LLM."""
@@ -1403,29 +1308,26 @@ class ResponseGenerator:
         context_parts = []
         sources_for_output = []
         seen_source_documents = set() # To track unique documents for citations
-        
+
         current_context_tokens = 0
-        # Estimate prompt overhead (system message + user message boilerplate)
         # This is a rough estimate; true overhead depends on model and prompt structure
         prompt_overhead_tokens = len(self.tokenizer.encode("You are an intelligent assistant designed to provide answers based only on the provided information. Do not use any outside knowledge. If the answer cannot be found in the provided context, state that you cannot answer the question based on the given information. For each statement in your answer, indicate which 'Source Document ID' it came from. If a piece of information is found in multiple sources, you may cite all relevant sources. --- Information: --- Question: ")) + \
-                                     len(self.tokenizer.encode(query)) # Add query tokens
+                                len(self.tokenizer.encode(query))
 
         available_tokens_for_context = LLM_MAX_TOKENS_CONTEXT - LLM_MAX_TOKENS_RESPONSE - prompt_overhead_tokens
-        
+
         if available_tokens_for_context <= 0:
             logger.warning(f"Not enough tokens available for context after reserving for response and prompt overhead. Available: {available_tokens_for_context}")
-            # Fallback to minimal context or error
             return {
                 'answer': "System token limits prevent generating a full response. Try a shorter query.",
                 'confidence': 0.0,
                 'sources': []
             }
 
-
         for i, chunk in enumerate(retrieved_chunks):
             chunk_content = chunk['content']
             chunk_document_id = chunk['document_id']
-            
+
             # Format the chunk content for LLM context
             formatted_chunk = f"Source Document ID: {chunk_document_id}\nChunk Content:\n{chunk_content}\n---"
             chunk_tokens = len(self.tokenizer.encode(formatted_chunk))
@@ -1450,7 +1352,6 @@ class ResponseGenerator:
         full_context = "\n\n".join(context_parts)
 
         # Define the prompt for the LLM
-        # Instruct the LLM to only use provided information and cite sources.
         prompt = f"""
                     You are an intelligent assistant designed to provide answers based *only* on the provided information.
                     Do not use any outside knowledge. If the answer cannot be found in the provided context, state that you cannot answer the question based on the given information.
@@ -1473,8 +1374,8 @@ class ResponseGenerator:
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt}
                 ],
-                temperature=0.0, # Make it less creative, more factual
-                max_tokens=LLM_MAX_TOKENS_RESPONSE # Adjust based on expected answer length
+                temperature=0.0,
+                max_tokens=LLM_MAX_TOKENS_RESPONSE
             )
             llm_answer = chat_completion.choices[0].message.content.strip()
             logger.info("LLM response generated.")
@@ -1486,7 +1387,6 @@ class ResponseGenerator:
             llm_answer = f"An unexpected error occurred during response generation: {e}."
 
         # Calculate confidence - simple average of top chunk scores
-        # More sophisticated confidence could involve LLM's own confidence or semantic similarity of answer to query
         avg_score = sum(chunk.get('similarity_score', 0) for chunk in retrieved_chunks) / len(retrieved_chunks) if retrieved_chunks else 0.0
         confidence = min(avg_score, 1.0) # Ensure it doesn't exceed 1.0
 
@@ -1494,10 +1394,10 @@ class ResponseGenerator:
             'answer': llm_answer,
             'confidence': confidence,
             'sources': sources_for_output,
-            'context_used_chunks_count': len(context_parts) # Report actual number of chunks used in context
+            'context_used_chunks_count': len(context_parts)
         }
 
-# =============================================================================
+
 # 9. PERSISTENCE MANAGER
 # =============================================================================
 
@@ -1506,24 +1406,21 @@ class StorageManager:
     def __init__(self, data_path: Path, storage_path: Path):
         self.data_path = data_path
         self.storage_path = storage_path
-        self.storage_path.mkdir(parents=True, exist_ok=True) # Ensure storage dir exists
+        self.storage_path.mkdir(parents=True, exist_ok=True)
 
     def _calculate_data_hash(self) -> str:
         """Calculates a hash of all files in the data directory."""
         hasher = hashlib.md5()
-        file_paths = sorted(list(self.data_path.rglob('*'))) # Get all files, sorted for consistency
+        file_paths = sorted(list(self.data_path.rglob('*')))
         for file_path in file_paths:
             if file_path.is_file():
                 try:
                     with open(file_path, 'rb') as f:
-                        # Read in chunks to handle large files
                         for chunk in iter(lambda: f.read(4096), b''):
                             hasher.update(chunk)
                 except Exception as e:
                     logger.error(f"Error reading file {file_path} for hash calculation: {e}")
-                    # Optionally, decide if this should lead to a different hash or halt
-                    # For now, we'll just log and continue, potentially leading to re-processing
-                    continue 
+                    continue
         return hasher.hexdigest()
 
     def _get_last_data_hash(self) -> Optional[str]:
@@ -1559,15 +1456,15 @@ class StorageManager:
     def save_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager):
         """Saves all relevant data structures. Only saves hash if all saves succeed."""
         all_saves_successful = True
-        
+
         if not vector_index_manager.save_index():
             all_saves_successful = False
             logger.error("Failed to save FAISS index. Skipping data hash update.")
-        
+
         if not kg_manager.save_graph():
             all_saves_successful = False
             logger.error("Failed to save Knowledge Graph. Skipping data hash update.")
-        
+
         if all_saves_successful:
             if self._save_data_hash(self._calculate_data_hash()):
                 logger.info("All data structures and data hash saved successfully.")
@@ -1576,21 +1473,20 @@ class StorageManager:
         else:
             logger.error("Some data structures failed to save. Data hash not updated.")
 
-
     def load_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager) -> bool:
         """Loads all relevant data structures. Returns True if successful, False otherwise."""
         vector_loaded = vector_index_manager.load_index()
         kg_loaded = kg_manager.load_graph()
-        
+
         if vector_loaded and kg_loaded and LAST_DATA_HASH_PATH.exists():
             # Only consider "loaded" if data hash exists, implies previous full save
             logger.info("All data structures loaded successfully.")
             return True
-        
+
         logger.warning("Incomplete or failed load of data structures. Will re-process data.")
         return False
 
-# =============================================================================
+
 # 10. MAIN RAG SYSTEM
 # =============================================================================
 
@@ -1600,8 +1496,8 @@ class SimpleAdvancedRAGSystem:
         # Pass OPENAI_API_KEY as an argument, even if it might be None for ST models
         self.embedding_service = EmbeddingService(
             api_key=os.getenv("OPENAI_API_KEY"),
-            model_name=EMBEDDING_MODEL_NAME, # This will now be 'all-MiniLM-L6-v2' from .env
-            embedding_dim=EMBEDDING_DIM      # This will now be '384' from .env
+            model_name=EMBEDDING_MODEL_NAME, # This will be 'all-MiniLM-L6-v2' from .env
+            embedding_dim=EMBEDDING_DIM      # This will be '384' from .env
         )
 
         self.storage_manager = StorageManager(DATA_PATH, STORAGE_PATH)
@@ -1671,7 +1567,7 @@ class SimpleAdvancedRAGSystem:
             all_relations.extend(relations)
 
         self.vector_index.add_chunks(all_chunks)
-        self.kg_manager.add_data(all_chunks, all_entities, all_relations) # Pass chunks to KG for chunk nodes
+        self.kg_manager.add_data(all_chunks, all_entities, all_relations)
 
         logger.info(f"Processed {len(documents)} documents, Created {len(all_chunks)} chunks, {len(all_entities)} Entities, {len(all_relations)} Relations.")
 
@@ -1686,10 +1582,8 @@ class SimpleAdvancedRAGSystem:
                         reader = pypdf.PdfReader(file_path)
                         for page in reader.pages:
                             # Extract text from each page and concatenate
-                            # Add a newline or space between page contents to maintain separation
                             content += page.extract_text(0) + "\n"
                         logger.info(f"Loaded PDF document: {file_path.name}")
-                        # Optional: Add the raw extracted text to logs for debugging (after pypdf extraction)
                         # logger.info(f"PDF EXTRACTED TEXT (first 500 chars of {file_path.name}):\n{content[:500]}\n...")
                     except Exception as e:
                         logger.error(f"Could not read PDF {file_path} using pypdf: {e}")
@@ -1716,25 +1610,25 @@ class SimpleAdvancedRAGSystem:
         try:
             # Retrieve relevant chunks
             retrieved_chunks = self.retrieval_engine.retrieve(query_text, top_k)
-            
+
             # Analyze query for response generation (can reuse analysis from retrieval engine if desired)
             query_analysis = self.retrieval_engine.query_processor.analyze_query(query_text)
-            
+
             # Generate response
             response = self.response_generator.generate_response(
                 query_text, retrieved_chunks, query_analysis
             )
-            
+
             # Add metadata
             response['query_analysis'] = query_analysis
             response['timestamp'] = datetime.now().isoformat()
             response['status'] = 'success'
-            
+
             logger.info("Query processed successfully.")
             return response
-            
+
         except Exception as e:
-            logger.exception(f"Error processing query: {e}") # Use exception to log traceback
+            logger.exception(f"Error processing query: {e}")
             return {
                 'status': 'error',
                 'error': str(e),
@@ -1762,7 +1656,7 @@ class SimpleAdvancedRAGSystem:
                 'timestamp': datetime.now().isoformat()
             }
 
-# =============================================================================
+
 # 11. USAGE EXAMPLE
 # =============================================================================
 
