@@ -24,7 +24,7 @@ from spacy.matcher import Matcher, PhraseMatcher
 
 # OpenAI & Sentence Transformers
 from openai import OpenAI, APIError
-from sentence_transformers import SentenceTransformer # This line is now active for Sentence Transformers
+from sentence_transformers import SentenceTransformer
 
 import knowledge_graph
 
@@ -38,9 +38,10 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
-# =============================================================================
+
 # Configuration Constants (Loaded from .env or default values)
 # =============================================================================
+
 # Embedding Model Configuration (for local embeddings via Sentence Transformers)
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2") # Default to ST model
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384")) # Default dimension for all-MiniLM-L6-v2
