@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title><center>CIROH RAG Chatbot</center></title>
+    <style>
+        body {
+            background: #f0f4f9;
+            margin: 0;
+            padding: 0;
+            font-family: 'Segoe UI', Arial, sans-serif;
+        }
+        .chat-container {
+            max-width: 600px;
+            margin: 40px auto;
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.08);
+            display: flex;
+            flex-direction: column;
+            height: 80vh;
+            overflow: hidden;
+        }
+        .chat-header {
+            padding: 24px 24px 12px 24px;
+            background: #fff;
+            border-bottom: 1px solid #e3e7ed;
+            font-size: 1.5rem;
+            font-weight: 600;
+            color: #1a73e8;
+            letter-spacing: 1px;
+        }
+        .messages {
+            flex: 1;
+            padding: 24px;
+            overflow-y: auto;
+            background: #f7fafd;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+        .bubble {
+            max-width: 75%;
+            padding: 14px 18px;
+            border-radius: 18px;
+            font-size: 1rem;
+            line-height: 1.5;
+            word-break: break-word;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+            margin-bottom: 2px;
+        }
+        .user {
+            align-self: flex-end;
+            background: linear-gradient(90deg, #1a73e8 0%, #4f8cff 100%);
+            color: #fff;
+            border-bottom-right-radius: 4px;
+        }
+        .bot {
+            align-self: flex-start;
+            background: #e9eef6;
+            color: #222;
+            border-bottom-left-radius: 4px;
+        }
+        .input-row {
+            display: flex;
+            padding: 18px 24px;
+            background: #fff;
+            border-top: 1px solid #e3e7ed;
+        }
+        #user-input {
+            flex: 1;
+            padding: 12px 16px;
+            border-radius: 8px;
+            border: 1px solid #cfd8dc;
+            font-size: 1rem;
+            outline: none;
+            transition: border 0.2s;
+        }
+        #user-input:focus {
+            border: 1.5px solid #1a73e8;
+        }
+        #send-btn {
+            padding: 0 24px;
+            margin-left: 12px;
+            border: none;
+            background: #1a73e8;
+            color: #fff;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+        #send-btn:disabled {
+            background: #b0c4de;
+            cursor: not-allowed;
+        }
+        @media (max-width: 700px) {
+            .chat-container {
+                max-width: 100vw;
+                height: 100vh;
+                border-radius: 0;
+            }
+            .chat-header, .input-row, .messages {
+                padding-left: 12px;
+                padding-right: 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="chat-container">
+        <div class="chat-header">CIROH RAG Chatbot</div>
+        <div class="messages" id="messages"></div>
+        <form class="input-row" id="chat-form" autocomplete="off" onsubmit="return false;">
+            <input type="text" id="user-input" placeholder="Type your question..." autocomplete="off" autofocus />
+            <button id="send-btn">Send</button>
+        </form>
+    </div>
+    <script>
+        const messagesDiv = document.getElementById('messages');
+        const userInput = document.getElementById('user-input');
+        const sendBtn = document.getElementById('send-btn');
+        const chatForm = document.getElementById('chat-form');
+
+        function appendMessage(sender, text) {
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble ' + sender;
+            bubble.innerHTML = text.replace(/\n/g, '<br>');
+            messagesDiv.appendChild(bubble);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const text = userInput.value.trim();
+            if (!text) return;
+            appendMessage('user', text);
+            userInput.value = '';
+            sendBtn.disabled = true;
+            try {
+                const res = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: text })
+                });
+                const data = await res.json();
+                appendMessage('bot', data.answer || data.error || 'No response');
+            } catch (e) {
+                appendMessage('bot', 'Error connecting to server.');
+            }
+            sendBtn.disabled = false;
+            userInput.focus();
+        }
+
+        chatForm.onsubmit = sendMessage;
+        userInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter') sendMessage();
+        });
+    </script>
+</body>
+</html>

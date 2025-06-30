@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  ciroh-rag:
+    build: .
+    container_name: ciroh-rag-system
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mount data directory for input documents
+      - ./data:/app/data
+      # Mount storage directory for persistence
+      - ./storage:/app/storage
+      # Mount cache directory for caching
+      - ./cache:/app/cache
+    environment:
+      # OpenAI API Key (required for LLM generation)
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Embedding model configuration
+      - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-all-MiniLM-L6-v2}
+      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
+      # LLM configuration
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-3.5-turbo}
+      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.7}
+      - LLM_MAX_TOKENS_CONTEXT=${LLM_MAX_TOKENS_CONTEXT:-4000}
+      - LLM_MAX_TOKENS_RESPONSE=${LLM_MAX_TOKENS_RESPONSE:-1000}
+      # Document processing settings
+      - TARGET_CHUNK_SIZE_TOKENS=${TARGET_CHUNK_SIZE_TOKENS:-512}
+      - CHUNK_OVERLAP_SENTENCES=${CHUNK_OVERLAP_SENTENCES:-2}
+      - MIN_CHUNK_SIZE_TOKENS=${MIN_CHUNK_SIZE_TOKENS:-20}
+      # Storage paths
+      - STORAGE_PATH=${STORAGE_PATH:-./storage}
+      - DATA_PATH=${DATA_PATH:-./data}
+      # Cache settings
+      - ENABLE_CACHE=${ENABLE_CACHE:-true}
+      - CACHE_DIR=${CACHE_DIR:-./cache}
+      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-10}
+      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-60}
+      - CACHE_VALIDITY_DAYS=${CACHE_VALIDITY_DAYS:-1}
+      # SpaCy model
+      - SPACY_MODEL=${SPACY_MODEL:-en_core_web_sm}
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  data:
+  storage:
+  cache:

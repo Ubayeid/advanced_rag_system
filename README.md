@@ -97,6 +97,64 @@ This project is actively under development with the following exciting next step
     SPACY_MODEL="en_core_web_sm"
     ```
 
+## Running with Docker
+
+You can run this project using Docker for a consistent and isolated environment. There are two main ways to use Docker:
+
+### 1. Using Docker Compose (Recommended)
+
+This is the easiest way if you want to manage environment variables and scale to multiple services in the future.
+
+1. **Build the Docker image and start the container:**
+
+    ```bash
+    docker-compose build
+    docker-compose up
+    ```
+
+2. **Environment Variables:**
+    - Create a `.env` file in your project root (see the example in the Installation section above).
+    - Docker Compose will automatically load environment variables from this file.
+
+3. **Stopping the container:**
+
+    ```bash
+    docker-compose down
+    ```
+
+### 2. Using Docker Directly
+
+If you prefer to use Docker without Compose:
+
+1. **Build the Docker image:**
+
+    ```bash
+    docker build -t hybrid-rag .
+    ```
+
+2. **Run the container:**
+
+    ```bash
+    docker run --rm -it \
+      -v $(pwd)/data:/app/data \
+      -v $(pwd)/storage:/app/storage \
+      -v $(pwd)/cache:/app/cache \
+      --env-file .env \
+      -p 8000:8000 \
+      hybrid-rag
+    ```
+    - This mounts your local `data`, `storage`, and `cache` directories into the container for persistence.
+    - The `--env-file .env` flag loads environment variables from your `.env` file.
+    - The `-p 8000:8000` flag exposes port 8000 if you use the web interface.
+
+3. **Stopping the container:**
+    - Press `Ctrl+C` in the terminal, or run `docker stop <container_id>` from another terminal.
+
+### Notes
+- Make sure your `data` directory contains your source documents before starting the container.
+- The output files (e.g., `knowledge_graph_interactive.html`, `knowledge_gap_report.md`) will be available in your project directory after the container runs.
+- If you change your data, simply restart the container to reprocess and update the knowledge base.
+
 ## Usage
 
 ### 1\. Prepare Your Data
@@ -105,10 +163,11 @@ This project is actively under development with the following exciting next step
 
 ### 2\. Run the System
 
-The project uses a `Makefile` for convenient execution.
+The project uses a `Dockerfile` for convenient execution.
 
 ```bash
-make run
+docker-compose build
+docker-compose up
 ```
 
 This command will:
@@ -123,7 +182,7 @@ This command will:
 
 ### 3\. View the Knowledge Graph Visualization
 
-After running `make run`, you will see messages indicating that the interactive graph HTML file has been saved:
+After running `docker-compose up`, you will see messages indicating that the interactive graph HTML file has been saved:
 
 ```
 Interactive knowledge graph saved to 'knowledge_graph_interactive.html' in your project directory.
@@ -146,7 +205,7 @@ You can open this file with any text editor or a Markdown viewer.
 
 ### 5\. Query the System
 
-In the terminal where you ran `make run`, you'll see a `Query>` prompt.
+In the terminal where you ran `docker-compose up` (or your chosen Docker run command), you'll see a `Query>` prompt.
 
 ```
 Enter your query (type 'exit' to quit):
@@ -157,7 +216,7 @@ Type your questions and press Enter. The system will retrieve relevant informati
 
 ### 6\. Managing Data Changes
 
-If you modify, add, or remove documents in the `./data` directory, simply run `make run` again. The system will automatically detect the changes (via a hash check of the data directory) and re-process everything, ensuring your knowledge base is always up-to-date.
+If you modify, add, or remove documents in the `./data` directory, simply stop and restart the Docker container (using `docker-compose up` or your Docker run command). The system will automatically detect the changes (via a hash check of the data directory) and re-process everything, ensuring your knowledge base is always up-to-date.
 
 ## Project Structure
 

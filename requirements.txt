@@ -13,3 +13,4 @@ tiktoken
 matplotlib
 sentence-transformers
 pypdf
+Flask

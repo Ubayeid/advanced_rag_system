@@ -1639,6 +1639,14 @@ class SimpleAdvancedRAGSystem:
         self.storage_manager.save_all(self.vector_index, self.kg_manager)
         logger.info("Knowledge base re-processing complete and saved.")
 
+        # Always regenerate the knowledge gap report after (re)initialization
+        import knowledge_graph
+        try:
+            knowledge_graph.analyze_rag_knowledge_graph(self)
+            print("Knowledge gap report saved to knowledge_gap_report.md and printed above.")
+        except Exception as e:
+            logger.error(f"Error during knowledge graph visualization/analysis: {e}")
+
     def _process_and_store_documents(self):
         """Processes documents from the DATA_PATH and stores them."""
         documents = self._load_documents_from_directory(DATA_PATH)
@@ -1758,72 +1766,16 @@ class SimpleAdvancedRAGSystem:
 # 11. USAGE EXAMPLE
 # =============================================================================
 
-if __name__ == "__main__":
-    # Initialize RAG system
-    rag_system = SimpleAdvancedRAGSystem()
+# Global variable to cache the RAG system instance
+_rag_system = None
 
-    # Initialize the knowledge base (loads from disk or re-processes)
-    rag_system.initialize_knowledge_base()
-    print("\nKnowledge Base Ready!")
-    sys.stdout.flush() # Added for better interactive output handling
-
-    print(f"System Stats: {rag_system.get_system_stats()}\n")
-    sys.stdout.flush() # Added for better interactive output handling
-
-    # --- ADD THE CALL TO VISUALIZE AND ANALYZE THE GRAPH HERE ---
-    # print("Generating interactive knowledge graph visualization and gap report...")
-    # sys.stdout.flush()
-    # try:
-    #     # Call the function from your knowledge_graph module
-    #     analysis_results = knowledge_graph.analyze_rag_knowledge_graph(rag_system)
-    #     print("Knowledge graph visualization generated. Check your default web browser for interactive plot.")
-    #     print(f"Knowledge gap report saved to knowledge_gap_report.md and printed above.")
-    #     sys.stdout.flush()
-    # except Exception as e:
-    #     logger.error(f"Error during knowledge graph visualization/analysis: {e}")
-    #     print(f"An error occurred during graph visualization: {e}")
-    #     sys.stdout.flush()
-    # --- END OF GRAPH VISUALIZATION ADDITION ---
-
-    print("\nEnter your query (type 'exit' to quit):")
-    sys.stdout.flush() # Added for better interactive output handling
-    while True:
-        try:
-            user_input = input("Query> ").strip()
-            sys.stdout.flush() # Crucial: Flush after input to clear input buffer echoes
-
-            if user_input.lower() in ("exit", "quit"):
-                print("Exiting interactive RAG system. Goodbye!")
-                sys.stdout.flush()
-                break
-            if not user_input:
-                continue
-
-            query_result = rag_system.query(user_input)
-            print("-" * 50)
-            sys.stdout.flush()
-            print(f"Answer: {query_result['answer']}")
-            sys.stdout.flush()
-            print(f"Confidence: {query_result['confidence']:.2f}")
-            sys.stdout.flush()
-            print(f"Sources Used:")
-            sys.stdout.flush()
-            for src in query_result['sources']:
-                print(f"  - Document: {src['document_id']} (Score: {src['score']:.2f})")
-                print(f"    Entities: {', '.join(src['entities_in_chunk']) if src['entities_in_chunk'] else 'None'}")
-                print(f"    Keywords: {', '.join(src['keywords_in_chunk']) if src['keywords_in_chunk'] else 'None'}")
-                sys.stdout.flush()
-            print(f"Query Analysis: {query_result['query_analysis']}")
-            sys.stdout.flush()
-            print("-" * 50 + "\n")
-            sys.stdout.flush()
-
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting interactive RAG system. Goodbye!")
-            sys.stdout.flush()
-            break
-        except Exception as e:
-            logger.exception(f"An error occurred during interactive query loop: {e}")
-            print(f"An unexpected error occurred: {e}")
-            sys.stdout.flush()
-            continue
+def answer_query(query: str) -> str:
+    global _rag_system
+    if _rag_system is None:
+        _rag_system = SimpleAdvancedRAGSystem()
+        _rag_system.initialize_knowledge_base()
+    result = _rag_system.query(query)
+    if result.get('status') == 'success':
+        return result.get('answer', 'No answer found.')
+    else:
+        return f"Error: {result.get('error', 'Unknown error')}"

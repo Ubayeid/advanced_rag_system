@@ -1,34 +1,434 @@
-# Python virtual environment
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+Pipfile.lock
+
+# poetry
+poetry.lock
+
+# pdm
+.pdm.toml
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 rag_env/
 
-# Data
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype static type analyzer
+.pytype/
+
+# Cython debug symbols
+cython_debug/
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# Vim
+*.swp
+*.swo
+*~
+
+# Emacs
+*~
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.tmp
+*.temp
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Project-specific
+# Data directories
 data/
 archived/
 
 # Generated storage and index files
 storage/
+cache/
 knowledge_gap_report.md
+knowledge_graph_interactive.html
 
-# Environment variables file
-.env
-
-# Python compiled files
-*.pyc
-__pycache__/
-
-# Distribution / build files
-.Python
-build/
-dist/
-*.egg-info/
-.cache/
-
-# IDE-specific files
-.vscode/ # Visual Studio Code settings
-.idea/   # PyCharm / IntelliJ IDEA
-
-# OS-specific files
-.DS_Store # macOS
-Thumbs.db # Windows
-
+# Logs
+*.log
 rag_system.log
+logs/
+
+# Model files and caches
+*.bin
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# FAISS indices
+*.faiss
+*.index
+
+# Embeddings and vectors
+embeddings/
+vectors/
+*.npy
+*.npz
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+.docker/
+
+# Kubernetes
+*.kubeconfig
+kubeconfig
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Ansible
+*.retry
+
+# Vagrant
+.vagrant/
+
+# Backup files
+*.bak
+*.backup
+*.old
+*.orig
+
+# Large files
+*.pdf
+*.zip
+*.tar.gz
+*.rar
+*.7z
+*.iso
+*.dmg
+*.exe
+*.msi
+*.deb
+*.rpm
+*.pkg
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Configuration files with secrets
+config.ini
+secrets.json
+credentials.json
+service-account-key.json
+
+# IDE and editor files
+*.sublime-project
+*.sublime-workspace
+.atom/
+.brackets.json
+.project
+.settings/
+.classpath
+
+# Node.js (if any frontend components)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npm
+.yarn-integrity
+
+# Ruby (if any Ruby components)
+*.gem
+*.rbc
+/.config
+/coverage/
+/InstalledFiles
+/pkg/
+/spec/reports/
+/spec/examples.txt
+/test/tmp/
+/test/version_tmp/
+/tmp/
+
+# Java (if any Java components)
+*.class
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+hs_err_pid*
+
+# C/C++ (if any compiled components)
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+
+# Go (if any Go components)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+
+# Rust (if any Rust components)
+/target/
+Cargo.lock
+
+# Scala (if any Scala components)
+*.class
+*.log
+.cache
+.history
+.repl_history
+
+# Clojure (if any Clojure components)
+.cpcache/
+.lein-repl-history
+.rebel_readline_history
+
+# Haskell (if any Haskell components)
+dist/
+dist-/
+cabal-dev/
+*.o
+*.hi
+*.hie
+*.chi
+*.chs.h
+*.dyn_o
+*.dyn_hi
+.hpc/
+.hsenv/
+.cabal-sandbox/
+cabal.sandbox.config
+*.prof
+*.aux
+*.hp
+*.eventlog
+
+# Local development
+.local/
+local/
+dev/
+development/
+
+# Production
+production/
+prod/
+.staging/
+
+# Testing
+test-results/
+test-output/
+.coverage
+.pytest_cache/
+
+# Documentation builds
+docs/_build/
+site/
+docs/build/
+
+# Package managers
+Pipfile.lock
+poetry.lock
+yarn.lock
+package-lock.json
+
+# Security
+*.pem
+*.key
+*.crt
+*.csr
+*.p12
+*.pfx
+
+# Monitoring and logging
+prometheus.yml
+grafana/
+*.prom
