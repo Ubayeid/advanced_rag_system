@@ -804,46 +804,80 @@ class DocumentProcessor:
 class VectorIndexManager:
     def __init__(self, embedding_dim: int = EMBEDDING_DIM):
         self.embedding_dim = embedding_dim
-        self.index: Optional[faiss.IndexFlatIP] = None
-        self.chunk_metadata: Dict[str, Any] = {} # Stores serialized chunk data
+        self.index: Optional[faiss.Index] = None
+        self.chunk_metadata: Dict[str, Any] = {}
         self.id_to_index: Dict[str, int] = {}
         self.index_to_id: Dict[int, str] = {}
         self.current_index = 0
         self._initialize_index()
 
-    def _initialize_index(self):
-        self.index = faiss.IndexFlatIP(self.embedding_dim)
+        # New parameters for IndexIVFFlat
+        self.nlist = 100 # Number of inverted lists (clusters). Adjust based on dataset size.
+        self.nprobe = 10 # Number of lists to search at query time. Higher = more accurate, slower.
+        self.training_vectors_limit = 10000 # Max number of vectors to use for training the index.
 
-    def add_chunks(self, chunks: List[DocumentChunk]):
-        """Add chunks to vector index"""
+    def _initialize_index(self):
+        """Initializes a new FAISS IndexIVFFlat index."""
+        # The quantizer is a simple flat index that the IVF index uses to cluster vectors
+        quantizer = faiss.IndexFlatIP(self.embedding_dim)
+        # Create the IndexIVFFlat index
+        self.index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, self.nlist, faiss.METRIC_INNER_PRODUCT)
+        self.index.make_direct_map() # Enables direct mapping from internal FAISS IDs to external IDs (though we use our own mapping)
+        logger.info(f"Initialized new FAISS IndexIVFFlat with nlist={self.nlist}.")
+
+    def add_chunks(self, chunks: List['DocumentChunk']): # Use forward reference for DocumentChunk
+        """Add chunks to vector index, performing training if necessary."""
         if not chunks:
             return
 
         embeddings_to_add = []
+        new_chunk_ids = []
         for chunk in chunks:
             if chunk.embedding is not None and chunk.id not in self.id_to_index: # Only add new chunks
                 embeddings_to_add.append(chunk.embedding)
-                # Store metadata
+                new_chunk_ids.append(chunk.id)
+                # Store metadata and mappings for new chunks
                 self.chunk_metadata[chunk.id] = chunk.to_dict()
-                # Store mappings
                 self.id_to_index[chunk.id] = self.current_index
                 self.index_to_id[self.current_index] = chunk.id
                 self.current_index += 1
             elif chunk.id in self.id_to_index:
                 # Update existing chunk metadata if content might have changed (though in this flow, it's new docs)
                 self.chunk_metadata[chunk.id] = chunk.to_dict()
+
         if embeddings_to_add:
             embeddings_array = np.array(embeddings_to_add).astype('float32')
+
+            # IndexIVFFlat requires training before adding vectors.
+            if not self.index.is_trained:
+                logger.info(f"FAISS index is not trained. Training with {min(len(embeddings_array), self.training_vectors_limit)} vectors.")
+                # Use a subset of vectors for training if the dataset is very large
+                if len(embeddings_array) > self.training_vectors_limit:
+                    # Randomly sample vectors for training
+                    training_indices = np.random.choice(len(embeddings_array), self.training_vectors_limit, replace=False)
+                    training_data = embeddings_array[training_indices]
+                else:
+                    training_data = embeddings_array
+
+                self.index.train(training_data)
+                logger.info("FAISS Index training complete.")
+
             self.index.add(embeddings_array)
             logger.info(f"Added {len(embeddings_to_add)} new embeddings to FAISS index. Total: {self.index.ntotal}")
 
     def search(self, query_embedding: np.ndarray, k: int = 5) -> List[Dict[str, Any]]:
-        """Search for similar chunks"""
+        """Search for similar chunks using the IVF index."""
+
         if self.index.ntotal == 0:
             logger.warning("FAISS index is empty. No search results.")
             return []
 
+        if not self.index.is_trained:
+            logger.error("FAISS index is not trained. Cannot perform search. Please add documents first.")
+            return []
+
         query_embedding = np.array([query_embedding]).astype('float32')
+
         distances, indices = self.index.search(query_embedding, min(k, self.index.ntotal))
 
         results = []
@@ -853,7 +887,6 @@ class VectorIndexManager:
                 chunk_dict = self.chunk_metadata.get(chunk_id, {})
 
                 if chunk_dict:
-                    # For search results, dict is fine to avoid unnecessary object creation
                     result_item = {
                         'chunk_id': chunk_id,
                         'similarity_score': float(dist),
@@ -867,11 +900,11 @@ class VectorIndexManager:
                     logger.warning(f"Index {idx} not found in chunk_metadata for chunk_id {chunk_id}. Data inconsistency.")
             else:
                 logger.warning(f"Index {idx} not found in index_to_id mapping. Data inconsistency.")
-
         return results
 
     def save_index(self):
         """Saves the FAISS index and associated metadata."""
+
         try:
             faiss.write_index(self.index, str(FAISS_INDEX_PATH))
             with open(CHUNK_METADATA_PATH, 'w', encoding='utf-8') as f:
@@ -888,6 +921,7 @@ class VectorIndexManager:
 
     def load_index(self):
         """Loads the FAISS index and associated metadata."""
+
         if (FAISS_INDEX_PATH.exists() and CHUNK_METADATA_PATH.exists() and
             ID_TO_INDEX_PATH.exists() and INDEX_TO_ID_PATH.exists()):
             try:
@@ -907,8 +941,6 @@ class VectorIndexManager:
                 return False
         logger.info("No existing FAISS index found. Starting fresh.")
         return False
-
-
 
 # 5. KNOWLEDGE GRAPH MANAGER
 # =============================================================================
