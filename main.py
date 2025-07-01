@@ -2,6 +2,7 @@ import pypdf
 import asyncio
 import json
 import numpy as np
+from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field
@@ -10,6 +11,7 @@ import uuid
 import logging
 import re
 import os
+import argparse
 from dotenv import load_dotenv
 import sys
 import hashlib
@@ -382,51 +384,61 @@ class DocumentProcessor:
 
         return chunks, entities, relations
 
-    def _clean_text(self, content: str) -> str:
-        # Initial cleanup: Remove non-ASCII and normalize whitespace aggressively
-        content = re.sub(r'[^\x00-\x7F]+', ' ', content)
+    def _clean_text(content: str) -> str:
+
+        # Replace various whitespace characters (tabs, newlines, form feeds, etc.) with a single space.
         content = re.sub(r'\s+', ' ', content)
 
-        # Remove common PDF internal artifacts
-
-        # Regex for common PDF object/stream identifiers (e.g., "0000000015 00000 n")
-        content = re.sub(r'\b\d+\s+\d+\s+n\b|\b\d{9,}\s+\d{5,}\b', ' ', content)
-        # Remove timestamps (e.g., "D:20250619015147Z")
+        # Remove Common PDF Internal Artifacts and Headers/Footers
+        content = re.sub(r'\b\d{5,}\s+\d{2,}\s+n\b|\b\d{9,}\s+\d{5,}\b', ' ', content)
+        # Remove timestamps (e.g., "D:20250619015147Z", common in PDF metadata dumps)
         content = re.sub(r'D:\d{14}Z', ' ', content)
-        # Remove common page number patterns (e.g., "1 of 10", or just isolated page numbers like "2 4")
-        content = re.sub(r'\bPage \d+ of \d+\b|\b\d+\s+\d+\b', ' ', content, flags=re.IGNORECASE)
+        # Remove common page number patterns
+        content = re.sub(r'\bPage \d+ of \d+\b|\b\d+ \/ \d+\b', ' ', content, flags=re.IGNORECASE)
+        # Remove Table of Contents (TOC) dot leaders (e.g., "Chapter 1 . . . . . . . 5")
+        content = re.sub(r'\s+\.{2,}\s*\d+\s*$', '', content, flags=re.MULTILINE)
 
-        # Remove very short sequences that look like OCR errors or PDF junk (e.g., "kI", "jE", "OV")
+        # Remove reference numbers like "[18]", "[19]", "[18, 19]", "[1, 2, 3]", or combined "[18][19]".
+        content = re.sub(r'\[\d+(?:,\s*\d+)*\](?:\[\d+(?:,\s*\d+)*\])*', ' ', content)
+        # Remove common section/subsection numbers (e.g., "2.1", "3.2.1") if they appear standalone or at line start.
+        content = re.sub(r'^\s*\d+(\.\d+)+\s+', ' ', content, flags=re.MULTILINE)
 
-        # This is more precise: look for 2-3 char sequences that are NOT common English words
-        content = re.sub(r'\b[A-Za-z]{2,3}\b', ' ', content) # Removes short words, some might be valid.
-        # Remove reference numbers like "[18][19]" or just standalone numbers that are unlikely to be meaningful entities.
-        content = re.sub(r'\[\d+\](\[\d+\])*', ' ', content) # Removes [18][19], [1], etc.
-        content = re.sub(r'\b\d+\.\d+\b', ' ', content) # Removes "2.2", "3.2", "4.3"
-        # After targeted removal, normalize whitespace again to clean up extra spaces left by substitutions
-        content = re.sub(r'\s+', ' ', content)
+        # Replace multiple spaces with a single space.
+        content = re.sub(r' {2,}', ' ', content)
+        # Remove leading/trailing whitespace from each line.
+        content = re.sub(r'^\s*|\s*$', '', content, flags=re.MULTILINE)
 
+        # Remove multiple consecutive blank lines, reducing them to at most two newlines.
+        content = re.sub(r'\n\s*\n', '\n\n', content)
+
+        # Final trim to remove any leading/trailing whitespace from the entire cleaned content.
         return content.strip()
 
     def _create_chunks(self, content: str, doc_id: str) -> List[DocumentChunk]:
-        """ Create overlapping chunks based on a recursive splitting strategy, respecting token limits and minimum chunk size. """
+        """
+        Creates overlapping chunks based on a more semantic/structural splitting strategy,
+        prioritizing document structure (like paragraphs, sections) before falling back
+        to sentence/character splits.
+        """
         chunks = []
         chunk_index = 0
 
-        # Use the EMBEDDING_MODEL_MAX_TOKENS from the embedding service instance
-        # This allows it to dynamically adapt to the actual max_seq_length of the loaded ST model.
         EMBEDDING_MODEL_HARD_MAX_TOKENS = self.embedding_service.EMBEDDING_MODEL_MAX_TOKENS
+        FALLBACK_CHAR_CHUNK_SIZE = int(EMBEDDING_MODEL_HARD_MAX_TOKENS * 0.9)
 
-        # A very safe fallback character split size, ensuring it's always smaller than the hard max.
-        FALLBACK_CHAR_CHUNK_SIZE = int(EMBEDDING_MODEL_HARD_MAX_TOKENS * 0.9) # Leave a bit more buffer
+        # Prioritize structural separators first
+        structural_separators = ["\n\n\n", "\n\n"]
+        sentence_level_separators = [". ", "? ", "! "]
+        word_level_separators = [" "]
 
-        separators = ["\n\n", "\n", ". ", "? ", "! ", " "]
+        # Combine all separators, ensuring structural ones are prioritized
+        all_separators = structural_separators + sentence_level_separators + word_level_separators
 
         def _split_recursively(text: str, current_separators: List[str]) -> List[str]:
             if not text:
                 return []
 
-            text_tokens = len(self.tokenizer.encode(text)) # Use LLM tokenizer for this count
+            text_tokens = len(self.tokenizer.encode(text))
 
             # Base case: if text fits within TARGET_CHUNK_SIZE_TOKENS, return it
             if text_tokens <= self.target_chunk_size_tokens:
@@ -434,46 +446,34 @@ class DocumentProcessor:
 
             # If no more semantic separators, force split by character
             if not current_separators:
-                # Break text into chunks of FALLBACK_CHAR_CHUNK_SIZE characters
                 sub_chunks = []
                 for i in range(0, len(text), FALLBACK_CHAR_CHUNK_SIZE):
                     sub_chunk = text[i:i + FALLBACK_CHAR_CHUNK_SIZE]
                     sub_chunks.append(sub_chunk)
-
-                    # Log a warning if even after char splitting, a sub_chunk still exceeds the hard token limit
                     if len(self.tokenizer.encode(sub_chunk)) > EMBEDDING_MODEL_HARD_MAX_TOKENS:
                         logger.warning(f"Recursive char split produced a chunk of {len(self.tokenizer.encode(sub_chunk))} tokens, still exceeding {EMBEDDING_MODEL_HARD_MAX_TOKENS}. Document: {doc_id}. Consider reducing CHUNK_SIZE_TOKENS or checking source document. Snippet: {sub_chunk[:100]}...")
                 return sub_chunks
 
-
             current_sep = current_separators[0]
             remaining_seps = current_separators[1:]
 
-            split_parts = text.split(current_sep)
+            # Handle potential empty parts from aggressive splitting (e.g., consecutive newlines)
+            split_parts = [part.strip() for part in text.split(current_sep) if part.strip()]
 
             collected_chunks_from_recursion = []
             current_group_of_parts = []
             current_group_tokens = 0
 
             for part in split_parts:
-                part = part.strip()
-                if not part:
-                    continue
-
                 part_tokens = len(self.tokenizer.encode(part))
-
-                # If adding this part makes the current group too large,
-                # process the current group and then handle the new part.
                 if current_group_tokens + part_tokens > self.target_chunk_size_tokens:
                     if current_group_of_parts:
-                        # Recursively split the collected parts.
+                        # Recursively split the collected parts using the next level of separators.
                         collected_chunks_from_recursion.extend(_split_recursively(
                             current_sep.join(current_group_of_parts), remaining_seps
                         ))
-
                     # The current 'part' itself might be too large, so recursively split it.
                     collected_chunks_from_recursion.extend(_split_recursively(part, remaining_seps))
-
                     # Reset collector for the next group
                     current_group_of_parts = []
                     current_group_tokens = 0
@@ -487,24 +487,25 @@ class DocumentProcessor:
                 collected_chunks_from_recursion.extend(_split_recursively(
                     current_sep.join(current_group_of_parts), remaining_seps
                 ))
-
             return collected_chunks_from_recursion
 
-        # Perform initial recursive split
-        pre_overlap_chunks = _split_recursively(content, separators)
+        # Perform initial recursive split using the new, prioritized separators
+        pre_overlap_chunks = _split_recursively(content, all_separators)
 
         # Now, combine chunks with overlap, ensuring final chunk size constraint
         current_overlap_sentences_buffer = []
         current_combined_chunk_content = []
         current_combined_chunk_tokens = 0
 
-        # Attempt to make sentence-level overlaps from the pre_overlap_chunks
         for pre_chunk_content in pre_overlap_chunks:
+            # MODERNIZATION: Ensure robust sentence segmentation.
+            # If self.nlp is available, it's preferred. Otherwise, fallback to basic split.
             if self.nlp:
                 doc_pre_chunk = self.nlp(pre_chunk_content)
-                sentences_from_pre_chunk = [sent.text for sent in doc_pre_chunk.sents]
+                sentences_from_pre_chunk = [sent.text.strip() for sent in doc_pre_chunk.sents if sent.text.strip()]
             else:
-                sentences_from_pre_chunk = [s.strip() for s in pre_chunk_content.split('. ') if s.strip()]
+                # Basic fallback if SpaCy NLP isn't loaded (less robust sentence segmentation)
+                sentences_from_pre_chunk = [s.strip() for s in re.split(r'(?<=[.?!])\s+', pre_chunk_content) if s.strip()]
 
             for sent in sentences_from_pre_chunk:
                 sent_tokens = len(self.tokenizer.encode(sent))
@@ -528,12 +529,11 @@ class DocumentProcessor:
                     current_combined_chunk_content = list(current_overlap_sentences_buffer)
                     current_combined_chunk_content.append(sent)
                     current_combined_chunk_tokens = len(self.tokenizer.encode(" ".join(current_combined_chunk_content)))
-                    current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:] 
+                    current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:]
                 else:
                     current_combined_chunk_content.append(sent)
                     current_combined_chunk_tokens += sent_tokens
                     current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:]
-
 
         # Add the very last remaining chunk
         if current_combined_chunk_content:
@@ -554,53 +554,90 @@ class DocumentProcessor:
         return chunks
 
     def _extract_entities(self, content: str, doc_id: str) -> List[KnowledgeEntity]:
-        """Extract named entities using spaCy NER and custom PhraseMatcher rules."""
-
-        entities = []
+        """
+        Extracts named entities using spaCy NER and custom PhraseMatcher rules.
+        Includes a conceptual step for entity resolution/canonicalization, attempting to group variations like "Ground water" and "groundwater".
+        """
+        entities_found = []
         if not self.nlp:
-            return entities
+            logger.error("SpaCy NLP model not loaded for entity extraction.")
+            return entities_found
 
         doc = self.nlp(content)
-        seen_entities = set()
+        temp_entities_for_resolution = []
 
-        # 1. Add entities found by spaCy's default NER
+        # 1. Collect entities found by spaCy's default NER
         for ent in doc.ents:
-            if len(ent.text.strip()) < 2 or ent.text.strip().isnumeric():
+            # Filter out very short or purely numeric entities that are unlikely to be meaningful names
+            if len(ent.text.strip()) < 2 or ent.text.strip().strip('-.').isnumeric(): # Added strip('-') for numbers like "3.1"
                 continue
-            entity_key = (ent.text.lower(), ent.label_)
-            if entity_key not in seen_entities:
-                entity = KnowledgeEntity(
-                    id=str(uuid.uuid4()),
-                    name=ent.text,
-                    entity_type=ent.label_,
-                    confidence=0.9,
-                    document_ids=[doc_id]
-                )
-                entities.append(entity)
-                seen_entities.add(entity_key)
+            # Store for later resolution
+            temp_entities_for_resolution.append({
+                'name': ent.text,
+                'entity_type': ent.label_,
+                'span': ent
+            })
 
-        # 2. Add entities found by custom PhraseMatcher rules
+        # 2. Collect entities found by custom PhraseMatcher rules
         if self.phrase_matcher:
             matches = self.phrase_matcher(doc)
             for match_id, start, end in matches:
                 span = doc[start:end]
                 custom_entity_type = self.nlp.vocab.strings[match_id]
 
-                if len(span.text.strip()) < 2 or span.text.strip().isnumeric():
+                if len(span.text.strip()) < 2 or span.text.strip().strip('-.').isnumeric():
                     continue
 
-                entity_key = (span.text.lower(), custom_entity_type)
-                if entity_key not in seen_entities:
-                    entity = KnowledgeEntity(
-                        id=str(uuid.uuid4()),
-                        name=span.text,
-                        entity_type=custom_entity_type,
-                        confidence=0.95, # Higher confidence for direct phrase matches
-                        document_ids=[doc_id]
-                    )
-                    entities.append(entity)
-                    seen_entities.add(entity_key)
+                # Prioritize custom types if they overlap with default NER, or add new ones
+                temp_entities_for_resolution.append({
+                    'name': span.text,
+                    'entity_type': custom_entity_type,
+                    'span': span
+                })
 
+        # 3. Conceptual Entity Resolution/Canonicalization
+        resolved_entities_map = defaultdict(lambda: {'id': str(uuid.uuid4()), 'document_ids': [], 'related_chunks': [], 'mentions': []})
+
+        for temp_ent in temp_entities_for_resolution:
+            entity_name_raw = temp_ent['name']
+            entity_type = temp_ent['entity_type']
+
+            # Step A: Lowercase
+            entity_name_lower = entity_name_raw.lower()
+
+            # Step B: Remove common non-alphanumeric separators (hyphens, spaces) for canonical key generation
+            entity_name_normalized = re.sub(r'[\s-]', '', entity_name_lower)
+
+            # Use the normalized name + type as the canonical key
+            canonical_key = f"{entity_name_normalized}::{entity_type}"
+
+            # Update the canonical entity's information
+            resolved_entities_map[canonical_key]['name'] = entity_name_raw
+            resolved_entities_map[canonical_key]['entity_type'] = entity_type
+            # Accumulate confidence (simple average or max could be used for more sophistication)
+            resolved_entities_map[canonical_key]['confidence'] = max(resolved_entities_map[canonical_key].get('confidence', 0.0), temp_ent.get('confidence', 0.9)) # Take max confidence from mentions
+
+            # Add document ID if not already present
+            if doc_id not in resolved_entities_map[canonical_key]['document_ids']:
+                resolved_entities_map[canonical_key]['document_ids'].append(doc_id)
+
+            # Store the original mention for potential later use (e.g., for showing context)
+            resolved_entities_map[canonical_key]['mentions'].append(entity_name_raw)
+
+        # Convert resolved entities back to KnowledgeEntity objects
+        entities = []
+        for key, resolved_data in resolved_entities_map.items():
+            entity = KnowledgeEntity(
+                id=resolved_data['id'],
+                name=resolved_data['name'],
+                entity_type=resolved_data['entity_type'],
+                confidence=min(resolved_data.get('confidence', 0.8), 1.0),
+                document_ids=list(set(resolved_data['document_ids'])),
+                related_chunks=[]
+            )
+            entities.append(entity)
+
+        logger.info(f"Extracted {len(entities)} unique canonical entities from document {doc_id}.")
         return entities
 
     def _extract_keywords(self, chunks: List[DocumentChunk]):
