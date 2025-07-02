@@ -51,8 +51,8 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384")) # Default dimension for a
 # LLM Model Configuration (for answer generation via OpenAI API)
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-3.5-turbo")
 LLM_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
-LLM_MAX_TOKENS_CONTEXT = int(os.getenv("LLM_MAX_TOKENS_CONTEXT", "4000")) # Max input tokens for LLM
-LLM_MAX_TOKENS_RESPONSE = int(os.getenv("LLM_MAX_TOKENS_RESPONSE", "1000")) # Max output tokens for LLM response
+LLM_MAX_TOKENS_CONTEXT = int(os.getenv("LLM_MAX_TOKENS_CONTEXT", "5000")) # Max input tokens for LLM
+LLM_MAX_TOKENS_RESPONSE = int(os.getenv("LLM_MAX_TOKENS_RESPONSE", "10000")) # Max output tokens for LLM response
 
 # Document Processing Settings (using token-based chunking for local models)
 TARGET_CHUNK_SIZE_TOKENS = int(os.getenv("CHUNK_SIZE_TOKENS", "512")) # Max tokens per chunk for embeddings
@@ -68,7 +68,7 @@ FAISS_INDEX_PATH = STORAGE_PATH / "faiss_index.bin"
 CHUNK_METADATA_PATH = STORAGE_PATH / "chunk_metadata.json"
 ID_TO_INDEX_PATH = STORAGE_PATH / "id_to_index.json"
 INDEX_TO_ID_PATH = STORAGE_PATH / "index_to_id.json"
-KG_GRAPH_PATH = STORAGE_PATH / "kg_graph.gml" # GML for NetworkX graph
+KG_GRAPH_PATH = STORAGE_PATH / "kg_graph.gml"
 KG_ENTITIES_PATH = STORAGE_PATH / "kg_entities.json"
 KG_RELATIONS_PATH = STORAGE_PATH / "kg_relations.json"
 LAST_DATA_HASH_PATH = STORAGE_PATH / "data_hash.txt"
@@ -823,11 +823,12 @@ class VectorIndexManager:
         quantizer = faiss.IndexFlatIP(self.embedding_dim)
         # Create the IndexIVFFlat index
         self.index = faiss.IndexIVFFlat(quantizer, self.embedding_dim, self.nlist, faiss.METRIC_INNER_PRODUCT)
-        self.index.make_direct_map() # Enables direct mapping from internal FAISS IDs to external IDs (though we use our own mapping)
+        self.index.make_direct_map() # Enables direct mapping from internal FAISS IDs to external IDs
         logger.info(f"Initialized new FAISS IndexIVFFlat with nlist={self.nlist}.")
 
     def add_chunks(self, chunks: List['DocumentChunk']): # Use forward reference for DocumentChunk
         """Add chunks to vector index, performing training if necessary."""
+
         if not chunks:
             return
 
@@ -843,7 +844,7 @@ class VectorIndexManager:
                 self.index_to_id[self.current_index] = chunk.id
                 self.current_index += 1
             elif chunk.id in self.id_to_index:
-                # Update existing chunk metadata if content might have changed (though in this flow, it's new docs)
+                # Update existing chunk metadata if content might have changed
                 self.chunk_metadata[chunk.id] = chunk.to_dict()
 
         if embeddings_to_add:

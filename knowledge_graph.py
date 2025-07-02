@@ -11,10 +11,9 @@ import json
 from datetime import datetime
 import spacy
 import os
-import logging # Import logging
+import logging
 
-logger = logging.getLogger(__name__) # Get logger instance
-
+logger = logging.getLogger(__name__)
 class KnowledgeGraphVisualizer:
     """Enhanced visualizer for the NetworkX-based knowledge graph"""
 
