@@ -17,7 +17,7 @@ web_logger = logging.getLogger(__name__)
 # This will ensure the knowledge base is built and KG analysis runs once when the Flask app starts.
 global_rag_system = None # Define a global variable for the RAG system in web_server.py
 
-@app.before_first_request
+@app.before_request
 def initialize_rag_system_on_startup():
     """  Initializes the RAG system and performs KG analysis when the Flask app receives its first request. """
 

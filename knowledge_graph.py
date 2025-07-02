@@ -21,44 +21,36 @@ class KnowledgeGraphVisualizer:
     def __init__(self, kg_manager):
         self.kg_manager = kg_manager
         self.graph = kg_manager.graph
-        # Ensure spacy model is loaded for visualization purposes, consistent with main.py
         try:
             self.nlp = spacy.load(os.getenv("SPACY_MODEL", "en_core_web_sm"))
-            self.nlp.max_length = 2_000_000  # Increase max_length to handle large documents
+            self.nlp.max_length = 2_000_000
         except OSError:
             logger.error("spaCy model 'en_core_web_sm' not found for KnowledgeGraphVisualizer. Visualization might be limited. Please install with: python -m spacy download en_core_web_sm")
             self.nlp = None
-
 
     def visualize_graph_static(self, figsize=(15, 10), save_path=None):
         """Create a static visualization using matplotlib"""
         plt.figure(figsize=figsize)
 
-        # Create layout
-        # Using a fixed seed for reproducibility of layout
         pos = nx.spring_layout(self.graph, k=0.5, iterations=50, seed=42)
 
-        # Separate nodes by type for distinct coloring and labeling
         entity_nodes = [n for n in self.graph.nodes() if self.graph.nodes[n].get('type') not in ['CHUNK', 'Document']]
         chunk_nodes = [n for n in self.graph.nodes() if self.graph.nodes[n].get('type') == 'CHUNK']
 
         # Draw nodes
-        # Use node name for entity labels, and 'CHUNK' ID/snippet for chunks
         node_labels = {}
         for node in self.graph.nodes():
             node_type = self.graph.nodes[node].get('type')
             if node_type == 'CHUNK':
-                # Use a snippet of content for chunk labels
                 content_snippet = self.graph.nodes[node].get('content', '')
-                node_labels[node] = content_snippet.split('...')[0] # Show start of snippet
+                node_labels[node] = content_snippet.split('...')[0]
             else:
-                node_labels[node] = self.graph.nodes[node].get('name', node) # Use name for entities, or ID if no name
+                node_labels[node] = self.graph.nodes[node].get('name', node)
 
         nx.draw_networkx_nodes(self.graph, pos, nodelist=entity_nodes, node_color='lightblue', node_size=500, alpha=0.8, label='Entities', edgecolors='black')
         nx.draw_networkx_nodes(self.graph, pos, nodelist=chunk_nodes, node_color='lightcoral', node_size=300, alpha=0.8, label='Chunks', edgecolors='black')
 
         # Draw edges
-        # Add edge labels (relation types)
         edge_labels = nx.get_edge_attributes(self.graph, 'relation_type')
         nx.draw_networkx_edges(self.graph, pos, alpha=0.3, width=1, arrowsize=10)
         nx.draw_networkx_edge_labels(self.graph, pos, edge_labels=edge_labels, font_size=7, alpha=0.7)
@@ -69,7 +61,7 @@ class KnowledgeGraphVisualizer:
         plt.title("Knowledge Graph Visualization", size=16)
         plt.legend()
         plt.axis('off')
-        plt.tight_layout() # Adjust layout to prevent labels from overlapping
+        plt.tight_layout()
 
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -81,10 +73,10 @@ class KnowledgeGraphVisualizer:
         if len(self.graph.nodes()) == 0:
             print("No nodes in the graph to visualize")
             return None
-        
+
         # Create layout
         pos = nx.spring_layout(self.graph, k=0.5, iterations=50, seed=42) # Fixed seed for consistency
-        
+
         # Prepare node data
         node_x = []
         node_y = []
@@ -92,20 +84,20 @@ class KnowledgeGraphVisualizer:
         node_size = []
         node_color = []
         node_type_map = {'CHUNK': 'lightcoral', 'PERSON': 'blue', 'ORG': 'green', 'GPE': 'purple',
-                         'STUDY': 'orange', 'WATER_BODY': 'cyan', 'HYDRO_MEASUREMENT': 'yellow',
-                         'POLLUTANT': 'red', 'HYDRO_EVENT': 'magenta', 'HYDRO_INFRASTRUCTURE': 'brown',
-                         'HYDRO_MODEL': 'lime', 'MISC': 'gray', 'DATE': 'darkblue', 'MONEY': 'darkgreen',
-                         'DEFAULT': 'lightgray'} # More specific colors
+                        'STUDY': 'orange', 'WATER_BODY': 'cyan', 'HYDRO_MEASUREMENT': 'yellow',
+                        'POLLUTANT': 'red', 'HYDRO_EVENT': 'magenta', 'HYDRO_INFRASTRUCTURE': 'brown',
+                        'HYDRO_MODEL': 'lime', 'MISC': 'gray', 'DATE': 'darkblue', 'MONEY': 'darkgreen',
+                        'DEFAULT': 'lightgray'} # More specific colors
 
         for node_id in self.graph.nodes():
             x, y = pos[node_id]
             node_x.append(x)
             node_y.append(y)
-            
+
             node_info = self.graph.nodes[node_id]
             node_type = node_info.get('type', 'DEFAULT')
             node_name = node_info.get('name', node_id) # Use name for entities, ID for chunks
-            
+
             # For chunks, use a content snippet in hover text
             if node_type == 'CHUNK':
                 display_name = f"Chunk: {node_id[:8]}..."
@@ -117,7 +109,7 @@ class KnowledgeGraphVisualizer:
             # Add relations that this node is part of to hover info
             incoming_edges = self.graph.in_edges(node_id, data=True)
             outgoing_edges = self.graph.out_edges(node_id, data=True)
-            
+
             if incoming_edges or outgoing_edges:
                 hover_content += "<br><b>Relations:</b>"
                 for u, v, data in incoming_edges:
@@ -129,17 +121,17 @@ class KnowledgeGraphVisualizer:
 
 
             node_text.append(hover_content)
-            
+
             connections = self.graph.degree(node_id) # Total number of connections
             node_size.append(10 + connections * 3) # Scale size by connections
             node_color.append(node_type_map.get(node_type, node_type_map['DEFAULT']))
-        
+
         node_trace = go.Scatter(
             x=node_x, y=node_y, text=node_text, mode='markers',
             hoverinfo='text',
             marker=dict(size=node_size, color=node_color, line_width=1, line_color='DarkSlateGrey')
         )
-        
+
         # Prepare edge data with arrow annotations for direction
         edge_x = []
         edge_y = []
@@ -161,7 +153,7 @@ class KnowledgeGraphVisualizer:
             if edge_length > 0:
                 ndx = (x1-x0) / edge_length
                 ndy = (y1-y0) / edge_length
-            
+
             edge_annotations.append(
                 go.layout.Annotation(
                     x=(mid_x + text_x_offset), # X-coordinate for text anchor and arrow head
@@ -175,7 +167,7 @@ class KnowledgeGraphVisualizer:
                     arrowhead=2, # Triangle arrow
                     arrowsize=1, arrowwidth=1, arrowcolor='gray',
                     opacity=0.7,
-                    
+
                     text=edge[2].get('relation_type', 'rel'),
                     font=dict(size=8, color='darkslategray'),
                     textangle=-np.degrees(np.arctan2(y1-y0, x1-x0)),
@@ -184,12 +176,12 @@ class KnowledgeGraphVisualizer:
             )
 
         edge_trace = go.Scatter(
-            x=edge_x, y=edge_y, mode='lines', 
-            line=dict(width=0.8, color='gray'), 
+            x=edge_x, y=edge_y, mode='lines',
+            line=dict(width=0.8, color='gray'),
             hoverinfo='none',
             opacity=0.7
         )
-        
+
         # Create figure
         fig = go.Figure(data=[edge_trace, node_trace], layout=go.Layout(
                             title=dict(text="Interactive Knowledge Graph", font=dict(size=16)),
@@ -256,10 +248,10 @@ class KnowledgeGapAnalyzer:
             'entity_coverage': self._analyze_entity_coverage(),
             'recommendations': []
         }
-        
+
         # Generate recommendations
         analysis['recommendations'] = self._generate_recommendations(analysis)
-        
+
         return analysis
 
     def _analyze_structural_gaps(self) -> Dict[str, Any]:
@@ -272,15 +264,6 @@ class KnowledgeGapAnalyzer:
 
         # Find isolated nodes (degree == 0 means no incoming or outgoing edges)
         isolated_nodes = [n for n in self.graph.nodes() if self.graph.degree(n) == 0]
-
-        # Find weakly connected components (treating directed graph as undirected for connectivity)
-        # Use a copy of the graph for connected_components if it's a DiGraph, otherwise it will complain
-        # if isinstance(self.graph, nx.DiGraph):
-        #     components = list(nx.weakly_connected_components(self.graph))
-        # else:
-        #     components = list(nx.connected_components(self.graph))
-                # For general connectivity in a MultiDiGraph, weakly_connected_components is appropriate
-        # as it considers connections regardless of direction.
 
         components = list(nx.weakly_connected_components(self.graph))
 
@@ -304,20 +287,20 @@ class KnowledgeGapAnalyzer:
         """Analyze content-related gaps"""
         entity_nodes = []
         document_nodes = []
-        
+
         for node in self.graph.nodes():
             node_data = self.graph.nodes[node]
             if node_data.get('type') and node_data.get('type') != 'CHUNK': # All non-chunk nodes are considered entities for this analysis
                 entity_nodes.append(node)
             elif node_data.get('type') == 'CHUNK':
                 document_nodes.append(node)
-        
+
         # Entity type distribution
         entity_types = defaultdict(int)
         for node in entity_nodes:
             entity_type = self.graph.nodes[node].get('type', 'UNKNOWN')
             entity_types[entity_type] += 1
-        
+
         # Find entities with few connections
         sparse_entities = []
         for entity in entity_nodes:
@@ -329,7 +312,7 @@ class KnowledgeGapAnalyzer:
                     'connections': connections,
                     'type': self.graph.nodes[entity].get('type', 'UNKNOWN')
                 })
-        
+
         return {
             'total_entities': len(entity_nodes),
             'total_documents': len(document_nodes),
@@ -341,26 +324,26 @@ class KnowledgeGapAnalyzer:
     def _analyze_connectivity_gaps(self) -> Dict[str, Any]:
             """Analyze connectivity patterns"""
             degrees = [self.graph.degree(n) for n in self.graph.nodes()]
-            
+
             if not degrees:
                 return {'error': 'No nodes to analyze'}
-            
+
             # For bridges and articulation points, convert to an undirected graph for proper calculation
             undirected_graph = self.graph.to_undirected()
 
             # Find bridge edges (not bridge nodes)
             bridges = list(nx.bridges(undirected_graph)) if nx.is_connected(undirected_graph) else []
-            
+
             # Find articulation points
             articulation_points = list(nx.articulation_points(undirected_graph))
-            
+
             # Calculate centrality measures
             try:
                 # Use the undirected_graph for centrality measures for consistency with bridges/articulation points
                 if undirected_graph.number_of_nodes() > 0 and undirected_graph.number_of_edges() > 0:
                     betweenness = nx.betweenness_centrality(undirected_graph)
                     closeness = nx.closeness_centrality(undirected_graph)
-                    
+
                     top_betweenness = sorted(betweenness.items(), key=lambda x: x[1], reverse=True)[:10]
                     top_closeness = sorted(closeness.items(), key=lambda x: x[1], reverse=True)[:10]
                 else:
@@ -371,7 +354,7 @@ class KnowledgeGapAnalyzer:
                 logger.warning(f"Error calculating centrality measures: {e}. Returning empty lists for centrality.")
                 top_betweenness = []
                 top_closeness = []
-            
+
             return {
                 'average_degree': np.mean(degrees),
                 'degree_distribution': {
@@ -392,7 +375,7 @@ class KnowledgeGapAnalyzer:
         """Analyze entity coverage across documents"""
         entity_doc_map = defaultdict(set) # Entity ID -> set of Document IDs
         doc_entity_map = defaultdict(set) # Document ID -> set of Entity IDs
-        
+
         # Iterate through all nodes that are entities and their 'MENTIONED_IN' edges to chunks
         for entity_id, entity_data in self.kg_manager.entities.items():
             for chunk_id in entity_data.related_chunks:
@@ -406,10 +389,10 @@ class KnowledgeGapAnalyzer:
 
         # Find entities mentioned in multiple documents
         cross_document_entities = {e_id: docs for e_id, docs in entity_doc_map.items() if len(docs) > 1}
-        
+
         # Find documents with few entities (e.g., less than 3 unique entities linked to them)
         sparse_documents = {d_id: entities for d_id, entities in doc_entity_map.items() if len(entities) < 3}
-        
+
         return {
             'cross_document_entities_count': len(cross_document_entities),
             'cross_document_entity_examples': [self.kg_manager.entities[e_id].name for e_id in list(cross_document_entities.keys())[:10]],
@@ -421,49 +404,49 @@ class KnowledgeGapAnalyzer:
     def _generate_recommendations(self, analysis: Dict[str, Any]) -> List[str]:
         """Generate actionable recommendations based on analysis"""
         recommendations = []
-        
+
         structural = analysis.get('structural_gaps', {})
         content = analysis.get('content_gaps', {})
         connectivity = analysis.get('connectivity_gaps', {})
         coverage = analysis.get('entity_coverage', {})
-        
+
         # Structural recommendations
         if structural.get('isolated_nodes', 0) > 0:
             recommendations.append(f"Address {structural['isolated_nodes']} isolated nodes ({structural['isolated_node_list'][:3]}...) by adding more contextual information in new documents or by enriching existing ones. These nodes are not connected to the main graph.")
-        
+
         if structural.get('connectivity_ratio', 0) < 0.7:
             recommendations.append(f"Improve overall graph connectivity (ratio: {structural.get('connectivity_ratio', 0):.2%}) by ensuring entities and chunks have more cross-references. This will help retrieve more related information.")
-        
+
         # Content recommendations
         if content.get('sparse_entities', []):
             recommendations.append(f"Expand context for {len(content['sparse_entities'])} sparsely connected entities (e.g., {content['sparse_entities'][0]['name']} with {content['sparse_entities'][0]['connections']} connections). Focus on adding documents or relations that link these entities to others.")
-        
+
         if content.get('entities_per_document', 0) < 3 and content.get('total_documents', 0) > 0:
             recommendations.append(f"The average number of entities per chunk/document is low ({content.get('entities_per_document', 0):.2f}). Consider refining entity extraction or adding richer documents.")
-        
+
         # Connectivity recommendations
         if connectivity.get('articulation_points', 0) > 0:
             recommendations.append(f"Strengthen connections around {connectivity['articulation_points']} critical nodes ({connectivity['critical_nodes_examples'][:3]}...). These nodes are crucial for graph connectivity, and their removal would partition the graph.")
-        
+
         if connectivity.get('bridges', 0) > 0:
             recommendations.append(f"There are {connectivity['bridges']} bridge edges. Consider adding redundant paths to connect the components linked by these bridges for improved robustness.")
 
         # Coverage recommendations
         if coverage.get('cross_document_entities_count', 0) < 5 and coverage.get('total_entities', 0) > 0:
             recommendations.append(f"Only {coverage.get('cross_document_entities_count', 0)} entities appear in multiple documents. Add more documents that share common entities to improve knowledge linking and retrieval across your corpus.")
-        
+
         if coverage.get('sparse_documents_count', 0) > 0:
             recommendations.append(f"There are {coverage['sparse_documents_count']} documents ({coverage['sparse_document_examples'][:3]}...) with very few entities. Review these documents for better entity extraction or consider if they are truly relevant.")
 
         if not recommendations:
             recommendations.append("Knowledge graph structure looks healthy, well-connected, and rich in entities!")
-        
+
         return recommendations
 
     def create_gap_report(self, save_path=None) -> str:
         """Create a comprehensive gap analysis report"""
         analysis = self.analyze_gaps()
-        
+
         report = f"""
 # Knowledge Graph Gap Analysis Report
 Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -486,7 +469,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ## Recommendations
 {self._format_recommendations(analysis['recommendations'])}
 """
-        
+
         if save_path:
             try:
                 with open(save_path, 'w', encoding='utf-8') as f:
@@ -494,7 +477,7 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 logger.info(f"Knowledge gap report saved to {save_path}")
             except Exception as e:
                 logger.error(f"Error saving knowledge gap report to {save_path}: {e}")
-        
+
         return report
 
     def _create_executive_summary(self, analysis):
@@ -542,38 +525,34 @@ Overall graph density: {structural.get('graph_density', 0):.4f}
     def _format_recommendations(self, recommendations):
         return '\n'.join([f"- {rec}" for rec in recommendations])
 
-# Usage example with the main RAG system
 def analyze_rag_knowledge_graph(rag_system):
     """Analyze and visualize the knowledge graph from a RAG system"""
-    
+
     # Create visualizer and analyzer
     visualizer = KnowledgeGraphVisualizer(rag_system.kg_manager)
     analyzer = KnowledgeGapAnalyzer(rag_system.kg_manager)
-    
+
     print("=== Knowledge Graph Analysis ===")
-    
+
     # 1. Create interactive visualization
     print("Creating interactive visualization...")
     fig = visualizer.visualize_graph_interactive()
     if fig:
         fig.show()
-    
+
     # 2. Generate gap analysis report
     print("\nGenerating gap analysis report...")
     report = analyzer.create_gap_report("knowledge_gap_report.md")
     # print(report)
-    
+
     # 3. Get detailed analysis
     detailed_analysis = analyzer.analyze_gaps()
-    
+
     return {
         'visualization': fig,
         'gap_analysis': detailed_analysis,
         'report': report
     }
 
-# Example usage:
 if __name__ == "__main__":
-    # This block is for testing knowledge_graph.py independently if needed.
-    # For full RAG system analysis, it will be called from main.py's __main__
     pass

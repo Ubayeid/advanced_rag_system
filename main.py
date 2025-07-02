@@ -386,30 +386,30 @@ class DocumentProcessor:
 
     def _clean_text(content: str) -> str:
 
-        # Replace various whitespace characters (tabs, newlines, form feeds, etc.) with a single space.
-        content = re.sub(r'\s+', ' ', content)
+        # # Replace various whitespace characters (tabs, newlines, form feeds, etc.) with a single space.
+        # content = re.sub(r'\s+', ' ', content)
 
-        # Remove Common PDF Internal Artifacts and Headers/Footers
-        content = re.sub(r'\b\d{5,}\s+\d{2,}\s+n\b|\b\d{9,}\s+\d{5,}\b', ' ', content)
-        # Remove timestamps (e.g., "D:20250619015147Z", common in PDF metadata dumps)
-        content = re.sub(r'D:\d{14}Z', ' ', content)
-        # Remove common page number patterns
-        content = re.sub(r'\bPage \d+ of \d+\b|\b\d+ \/ \d+\b', ' ', content, flags=re.IGNORECASE)
-        # Remove Table of Contents (TOC) dot leaders (e.g., "Chapter 1 . . . . . . . 5")
-        content = re.sub(r'\s+\.{2,}\s*\d+\s*$', '', content, flags=re.MULTILINE)
+        # # Remove Common PDF Internal Artifacts and Headers/Footers
+        # content = re.sub(r'\b\d{5,}\s+\d{2,}\s+n\b|\b\d{9,}\s+\d{5,}\b', ' ', content)
+        # # Remove timestamps (e.g., "D:20250619015147Z", common in PDF metadata dumps)
+        # content = re.sub(r'D:\d{14}Z', ' ', content)
+        # # Remove common page number patterns
+        # content = re.sub(r'\bPage \d+ of \d+\b|\b\d+ \/ \d+\b', ' ', content, flags=re.IGNORECASE)
+        # # Remove Table of Contents (TOC) dot leaders (e.g., "Chapter 1 . . . . . . . 5")
+        # content = re.sub(r'\s+\.{2,}\s*\d+\s*$', '', content, flags=re.MULTILINE)
 
-        # Remove reference numbers like "[18]", "[19]", "[18, 19]", "[1, 2, 3]", or combined "[18][19]".
-        content = re.sub(r'\[\d+(?:,\s*\d+)*\](?:\[\d+(?:,\s*\d+)*\])*', ' ', content)
-        # Remove common section/subsection numbers (e.g., "2.1", "3.2.1") if they appear standalone or at line start.
-        content = re.sub(r'^\s*\d+(\.\d+)+\s+', ' ', content, flags=re.MULTILINE)
+        # # Remove reference numbers like "[18]", "[19]", "[18, 19]", "[1, 2, 3]", or combined "[18][19]".
+        # content = re.sub(r'\[\d+(?:,\s*\d+)*\](?:\[\d+(?:,\s*\d+)*\])*', ' ', content)
+        # # Remove common section/subsection numbers (e.g., "2.1", "3.2.1") if they appear standalone or at line start.
+        # content = re.sub(r'^\s*\d+(\.\d+)+\s+', ' ', content, flags=re.MULTILINE)
 
-        # Replace multiple spaces with a single space.
-        content = re.sub(r' {2,}', ' ', content)
-        # Remove leading/trailing whitespace from each line.
-        content = re.sub(r'^\s*|\s*$', '', content, flags=re.MULTILINE)
+        # # Replace multiple spaces with a single space.
+        # content = re.sub(r' {2,}', ' ', content)
+        # # Remove leading/trailing whitespace from each line.
+        # content = re.sub(r'^\s*|\s*$', '', content, flags=re.MULTILINE)
 
-        # Remove multiple consecutive blank lines, reducing them to at most two newlines.
-        content = re.sub(r'\n\s*\n', '\n\n', content)
+        # # Remove multiple consecutive blank lines, reducing them to at most two newlines.
+        # content = re.sub(r'\n\s*\n', '\n\n', content)
 
         # Final trim to remove any leading/trailing whitespace from the entire cleaned content.
         return content.strip()
@@ -809,15 +809,16 @@ class VectorIndexManager:
         self.id_to_index: Dict[str, int] = {}
         self.index_to_id: Dict[int, str] = {}
         self.current_index = 0
-        self._initialize_index()
 
-        # New parameters for IndexIVFFlat
-        self.nlist = 100 # Number of inverted lists (clusters). Adjust based on dataset size.
+        self.nlist = 100 # Number of inverted lists (clusters).
         self.nprobe = 10 # Number of lists to search at query time. Higher = more accurate, slower.
         self.training_vectors_limit = 10000 # Max number of vectors to use for training the index.
 
+        self._initialize_index()
+
     def _initialize_index(self):
         """Initializes a new FAISS IndexIVFFlat index."""
+
         # The quantizer is a simple flat index that the IVF index uses to cluster vectors
         quantizer = faiss.IndexFlatIP(self.embedding_dim)
         # Create the IndexIVFFlat index
@@ -1116,15 +1117,13 @@ class KnowledgeGraphManager:
         logger.info("No existing Knowledge Graph found. Starting fresh.")
         return False
 
-
-
 # 6. QUERY PROCESSOR
 # =============================================================================
 
 class QueryProcessor:
     def __init__(self):
         try:
-            self.nlp = spacy.load(SPACY_MODEL) # Use SPACY_MODEL from .env
+            self.nlp = spacy.load(SPACY_MODEL)
         except OSError:
             logger.error(f"spaCy model '{SPACY_MODEL}' not found for QueryProcessor. Install with: python -m spacy download {SPACY_MODEL}")
             self.nlp = None
@@ -1377,7 +1376,7 @@ class ResponseGenerator:
         # Prepare context for the LLM
         context_parts = []
         sources_for_output = []
-        seen_source_documents = set() # To track unique documents for citations
+        seen_source_documents = set()
 
         current_context_tokens = 0
         # This is a rough estimate; true overhead depends on model and prompt structure
@@ -1562,20 +1561,18 @@ class StorageManager:
 
 class SimpleAdvancedRAGSystem:
     def __init__(self):
-        # Initialize shared embedding service
-        # Pass OPENAI_API_KEY as an argument, even if it might be None for ST models
         self.embedding_service = EmbeddingService(
             api_key=os.getenv("OPENAI_API_KEY"),
-            model_name=EMBEDDING_MODEL_NAME, # This will be 'all-MiniLM-L6-v2' from .env
-            embedding_dim=EMBEDDING_DIM      # This will be '384' from .env
+            model_name=EMBEDDING_MODEL_NAME,
+            embedding_dim=EMBEDDING_DIM
         )
 
         self.storage_manager = StorageManager(DATA_PATH, STORAGE_PATH)
-        self.doc_processor = DocumentProcessor(self.embedding_service) # Pass embedding service
-        self.vector_index = VectorIndexManager(embedding_dim=EMBEDDING_DIM) # Ensure embedding_dim matches chosen model
+        self.doc_processor = DocumentProcessor(self.embedding_service)
+        self.vector_index = VectorIndexManager(embedding_dim=EMBEDDING_DIM)
         self.kg_manager = KnowledgeGraphManager()
-        self.retrieval_engine = HybridRetrievalEngine(self.vector_index, self.kg_manager, self.embedding_service) # Pass embedding service
-        self.response_generator = ResponseGenerator() # This still uses OpenAI's LLM, so it will still need the API key
+        self.retrieval_engine = HybridRetrievalEngine(self.vector_index, self.kg_manager, self.embedding_service)
+        self.response_generator = ResponseGenerator()
 
         logger.info("RAG System components initialized.")
 
