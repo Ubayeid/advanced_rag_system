@@ -22,8 +22,9 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 
 # Install Python dependencies
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
-    pip install --no-cache-dir -r requirements.txt
+# Removed --no-cache-dir to enable pip caching for faster rebuilds
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install -r requirements.txt
 
 # Download spaCy model
 RUN python -m spacy download en_core_web_sm
@@ -40,10 +41,10 @@ RUN mkdir -p storage data cache
 # Set permissions
 RUN chmod +x main.py
 
-# Expose port (if needed for web interface in future)
+# Expose port for the web interface
 EXPOSE 8000
 
-# Create a non-root user for security
+# Create a non-root user for security and switch to it
 RUN useradd --create-home --shell /bin/bash app && \
     chown -R app:app /app
 USER app
@@ -67,9 +68,10 @@ ENV REQUEST_TIMEOUT=60
 ENV CACHE_VALIDITY_DAYS=1
 ENV SPACY_MODEL="en_core_web_sm"
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import sys; sys.exit(0)" || exit 1
+# Health check (uncomment if you want to enable this)
+# HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+#     CMD python -c "import sys; sys.exit(0)" || exit 1
 
-# Default command
-CMD ["python", "web_server.py"]
+# Default command to run the Flask application using Gunicorn
+# This replaces `python web_server.py` with Gunicorn
+CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:8000", "web_server:app"]
