@@ -2,6 +2,7 @@ import matplotlib.pyplot as plt
 import networkx as nx
 import plotly.graph_objects as go
 import plotly.express as px
+import plotly.io as pio
 from plotly.subplots import make_subplots
 import pandas as pd
 from typing import Dict, List, Any, Tuple
@@ -14,6 +15,7 @@ import os
 import logging
 
 logger = logging.getLogger(__name__)
+
 class KnowledgeGraphVisualizer:
     """Enhanced visualizer for the NetworkX-based knowledge graph"""
 
@@ -29,6 +31,11 @@ class KnowledgeGraphVisualizer:
 
     def visualize_graph_static(self, figsize=(15, 10), save_path=None):
         """Create a static visualization using matplotlib"""
+
+        if len(self.graph.nodes()) == 0:
+            logger.warning("No nodes in the graph to visualize for static plot.")
+            return
+
         plt.figure(figsize=figsize)
 
         pos = nx.spring_layout(self.graph, k=0.5, iterations=50, seed=42)
@@ -42,7 +49,7 @@ class KnowledgeGraphVisualizer:
             node_type = self.graph.nodes[node].get('type')
             if node_type == 'CHUNK':
                 content_snippet = self.graph.nodes[node].get('content', '')
-                node_labels[node] = content_snippet.split('...')[0]
+                node_labels[node] = content_snippet.split('...')[0] if '...' in content_snippet else content_snippet[:20] + '...' # Safer snippet
             else:
                 node_labels[node] = self.graph.nodes[node].get('name', node)
 
@@ -63,14 +70,17 @@ class KnowledgeGraphVisualizer:
         plt.tight_layout()
 
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-
-        plt.show()
+            try:
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                logger.info(f"Static graph saved to {save_path}")
+            except Exception as e:
+                logger.error(f"Error saving static graph to {save_path}: {e}")
 
     def visualize_graph_interactive(self, height=800):
         """Create an interactive visualization using Plotly"""
+
         if len(self.graph.nodes()) == 0:
-            print("No nodes in the graph to visualize")
+            logger.warning("No nodes in the graph to visualize for interactive plot.")
             return None
 
         # Create layout
@@ -82,11 +92,14 @@ class KnowledgeGraphVisualizer:
         node_text = [] # For hover text
         node_size = []
         node_color = []
-        node_type_map = {'CHUNK': 'lightcoral', 'PERSON': 'blue', 'ORG': 'green', 'GPE': 'purple',
-                        'STUDY': 'orange', 'WATER_BODY': 'cyan', 'HYDRO_MEASUREMENT': 'yellow',
-                        'POLLUTANT': 'red', 'HYDRO_EVENT': 'magenta', 'HYDRO_INFRASTRUCTURE': 'brown',
-                        'HYDRO_MODEL': 'lime', 'MISC': 'gray', 'DATE': 'darkblue', 'MONEY': 'darkgreen',
-                        'DEFAULT': 'lightgray'} # More specific colors
+        node_type_map = {
+            'CHUNK': 'lightcoral', 'PERSON': 'blue', 'ORG': 'green', 'GPE': 'purple',
+            'STUDY': 'orange', 'WATER_BODY': 'cyan', 'HYDRO_MEASUREMENT': 'yellow',
+            'POLLUTANT': 'red', 'HYDRO_EVENT': 'magenta', 'HYDRO_INFRASTRUCTURE': 'brown',
+            'HYDRO_MODEL': 'lime', 'MISC': 'gray', 'DATE': 'darkblue', 'MONEY': 'darkgreen',
+            'DATASET': 'teal', # Added DATASET
+            'DEFAULT': 'lightgray'
+        } # More specific colors
 
         for node_id in self.graph.nodes():
             x, y = pos[node_id]
@@ -100,10 +113,22 @@ class KnowledgeGraphVisualizer:
             # For chunks, use a content snippet in hover text
             if node_type == 'CHUNK':
                 display_name = f"Chunk: {node_id[:8]}..."
-                hover_content = f"<b>ID:</b> {node_id}<br><b>Type:</b> {node_type}<br><b>Content:</b> {node_info.get('content', 'N/A')}"
+                hover_content = (
+                    f"<b>ID:</b> {node_id}<br>"
+                    f"<b>Type:</b> {node_type}<br>"
+                    f"<b>Document:</b> {node_info.get('document_id', 'N/A')}<br>"
+                    f"<b>Page:</b> {node_info.get('page_number', 'N/A')}<br>"
+                    f"<b>Section:</b> {node_info.get('section_title', 'N/A')}<br>"
+                    f"<b>Content:</b> {node_info.get('content', 'N/A')}"
+                )
             else:
                 display_name = f"{node_name}" # Display full name for entities
-                hover_content = f"<b>Name:</b> {node_name}<br><b>ID:</b> {node_id}<br><b>Type:</b> {node_type}"
+                hover_content = (
+                    f"<b>Name:</b> {node_name}<br>"
+                    f"<b>ID:</b> {node_id}<br>"
+                    f"<b>Type:</b> {node_type}<br>"
+                    f"<b>Documents:</b> {', '.join(node_info.get('document_ids', ['N/A']))}"
+                )
 
             # Add relations that this node is part of to hover info
             incoming_edges = self.graph.in_edges(node_id, data=True)
@@ -117,7 +142,6 @@ class KnowledgeGraphVisualizer:
                 for u, v, data in outgoing_edges:
                     target_node_display = self.graph.nodes[v].get('name', v[:8] + '...') if self.graph.nodes[v].get('type') != 'CHUNK' else f"Chunk:{v[:8]}..."
                     hover_content += f"<br> &rarr; {data.get('relation_type', 'related to')} {target_node_display}"
-
 
             node_text.append(hover_content)
 
@@ -145,34 +169,40 @@ class KnowledgeGraphVisualizer:
             mid_x = (x0 + x1) / 2
             mid_y = (y0 + y1) / 2
 
+            # Adjust offsets for text to be slightly off the center of the line
             text_x_offset = (x1 - x0) * 0.1
             text_y_offset = (y1 - y0) * 0.1
 
-            edge_length = np.sqrt((x1-x0)**2 + (y1-y0)**2) # Calculate length here
+            edge_length = np.sqrt((x1-x0)**2 + (y1-y0)**2)
+            # Avoid division by zero if nodes are at the same position
             if edge_length > 0:
-                ndx = (x1-x0) / edge_length
-                ndy = (y1-y0) / edge_length
+                # Calculate angle for text rotation
+                angle_rad = np.arctan2(y1 - y0, x1 - x0)
+                angle_deg = np.degrees(angle_rad)
+                # Adjust for text upside down if necessary
+                if angle_deg > 90 or angle_deg < -90:
+                    angle_deg += 180
 
-            edge_annotations.append(
-                go.layout.Annotation(
-                    x=(mid_x + text_x_offset), # X-coordinate for text anchor and arrow head
-                    y=(mid_y + text_y_offset), # Y-coordinate for text anchor and arrow head
-                    xref='x', yref='y', # Reference to the plot axes
+                edge_annotations.append(
+                    go.layout.Annotation(
+                        x=(mid_x + text_x_offset), # X-coordinate for text anchor and arrow head
+                        y=(mid_y + text_y_offset), # Y-coordinate for text anchor and arrow head
+                        xref='x', yref='y', # Reference to the plot axes
 
-                    ax=x0, ay=y0, # Arrow tail at source node's original x, y
-                    axref='x', ayref='y', # Reference to the plot axes
+                        ax=x0, ay=y0, # Arrow tail at source node's original x, y
+                        axref='x', ayref='y', # Reference to the plot axes
 
-                    showarrow=True,
-                    arrowhead=2, # Triangle arrow
-                    arrowsize=1, arrowwidth=1, arrowcolor='gray',
-                    opacity=0.7,
+                        showarrow=True,
+                        arrowhead=2, # Triangle arrow
+                        arrowsize=1, arrowwidth=1, arrowcolor='gray',
+                        opacity=0.7,
 
-                    text=edge[2].get('relation_type', 'rel'),
-                    font=dict(size=8, color='darkslategray'),
-                    textangle=-np.degrees(np.arctan2(y1-y0, x1-x0)),
-                    xanchor="center", yanchor="bottom",
+                        text=edge[2].get('relation_type', 'rel'),
+                        font=dict(size=8, color='darkslategray'),
+                        textangle=angle_deg, # Use calculated angle
+                        xanchor="center", yanchor="bottom",
+                    )
                 )
-            )
 
         edge_trace = go.Scatter(
             x=edge_x, y=edge_y, mode='lines',
@@ -216,20 +246,18 @@ class KnowledgeGraphVisualizer:
                             height=height
                         ))
 
-        # --- IMPORTANT: We only write to HTML, do NOT call fig.show() here ---
+        # --- IMPORTANT: We only write to HTML. Do NOT call fig.show() here. ---
+        # Plotly.io.show() will try to open a browser, which fails in headless Docker containers.
         try:
-            output_html_file = "knowledge_graph_interactive.html"
+            output_html_file = os.path.join(os.getenv("STORAGE_PATH", "./storage"), "knowledge_graph_interactive.html")
             fig.write_html(output_html_file)
-            logger.info(f"Interactive graph saved to {output_html_file}")
-            # No automatic os.system('xdg-open') or fig.show() here.
-            # The user will manually open the HTML file.
-
+            # logger.info(f"Interactive graph saved to {output_html_file}")
         except Exception as e:
             logger.error(f"Error saving interactive graph to HTML: {e}")
-            print(f"Error saving interactive graph to HTML: {e}") # Print to terminal too
-            return None # Return None if saving fails
+            print(f"Error saving interactive graph to HTML: {e}")
+            return None
 
-        return fig # Still return the figure object
+        return fig
 
 class KnowledgeGapAnalyzer:
     """Comprehensive knowledge gap analysis"""
@@ -289,7 +317,8 @@ class KnowledgeGapAnalyzer:
 
         for node in self.graph.nodes():
             node_data = self.graph.nodes[node]
-            if node_data.get('type') and node_data.get('type') != 'CHUNK': # All non-chunk nodes are considered entities for this analysis
+            # Use 'type' attribute to distinguish entities from chunks
+            if node_data.get('type') and node_data.get('type') != 'CHUNK':
                 entity_nodes.append(node)
             elif node_data.get('type') == 'CHUNK':
                 document_nodes.append(node)
@@ -304,7 +333,7 @@ class KnowledgeGapAnalyzer:
         sparse_entities = []
         for entity in entity_nodes:
             connections = self.graph.degree(entity) # Use .degree() for total connections
-            if connections < 2:
+            if connections < 2: # Entities with 0 or 1 connection
                 sparse_entities.append({
                     'entity_id': entity,
                     'name': self.graph.nodes[entity].get('name', entity),
@@ -321,54 +350,64 @@ class KnowledgeGapAnalyzer:
         }
 
     def _analyze_connectivity_gaps(self) -> Dict[str, Any]:
-            """Analyze connectivity patterns"""
-            degrees = [self.graph.degree(n) for n in self.graph.nodes()]
+        """Analyze connectivity patterns"""
+        degrees = [self.graph.degree(n) for n in self.graph.nodes()]
 
-            if not degrees:
-                return {'error': 'No nodes to analyze'}
+        if not degrees:
+            return {'error': 'No nodes to analyze'}
 
-            # For bridges and articulation points, convert to an undirected graph for proper calculation
-            undirected_graph = self.graph.to_undirected()
+        # For bridges and articulation points, convert to an undirected graph for proper calculation
+        undirected_graph = self.graph.to_undirected()
 
-            # Find bridge edges (not bridge nodes)
-            bridges = list(nx.bridges(undirected_graph)) if nx.is_connected(undirected_graph) else []
+        # Check if the undirected graph is connected before finding bridges
+        # Bridges only make sense in a connected component
+        bridges = []
+        if nx.is_connected(undirected_graph):
+            bridges = list(nx.bridges(undirected_graph))
+        else:
+            logger.info("Graph is not connected, cannot accurately identify all bridges globally. Analyzing within components.")
+            # Optionally, analyze bridges per connected component if desired for more granular info
+            for component_nodes in nx.connected_components(undirected_graph):
+                subgraph = undirected_graph.subgraph(component_nodes)
+                bridges.extend(list(nx.bridges(subgraph)))
 
-            # Find articulation points
-            articulation_points = list(nx.articulation_points(undirected_graph))
 
-            # Calculate centrality measures
-            try:
-                # Use the undirected_graph for centrality measures for consistency with bridges/articulation points
-                if undirected_graph.number_of_nodes() > 0 and undirected_graph.number_of_edges() > 0:
-                    betweenness = nx.betweenness_centrality(undirected_graph)
-                    closeness = nx.closeness_centrality(undirected_graph)
+        # Find articulation points
+        articulation_points = list(nx.articulation_points(undirected_graph))
 
-                    top_betweenness = sorted(betweenness.items(), key=lambda x: x[1], reverse=True)[:10]
-                    top_closeness = sorted(closeness.items(), key=lambda x: x[1], reverse=True)[:10]
-                else:
-                    betweenness, closeness = {}, {}
-                    top_betweenness, top_closeness = [], []
+        # Calculate centrality measures
+        try:
+            # Use the undirected_graph for centrality measures for consistency with bridges/articulation points
+            if undirected_graph.number_of_nodes() > 0 and undirected_graph.number_of_edges() > 0:
+                betweenness = nx.betweenness_centrality(undirected_graph)
+                closeness = nx.closeness_centrality(undirected_graph)
 
-            except Exception as e:
-                logger.warning(f"Error calculating centrality measures: {e}. Returning empty lists for centrality.")
-                top_betweenness = []
-                top_closeness = []
+                top_betweenness = sorted(betweenness.items(), key=lambda x: x[1], reverse=True)[:10]
+                top_closeness = sorted(closeness.items(), key=lambda x: x[1], reverse=True)[:10]
+            else:
+                betweenness, closeness = {}, {}
+                top_betweenness, top_closeness = [], []
 
-            return {
-                'average_degree': np.mean(degrees),
-                'degree_distribution': {
-                    'min': min(degrees),
-                    'max': max(degrees),
-                    'mean': np.mean(degrees),
-                    'median': np.median(degrees),
-                    'std': np.std(degrees)
-                },
-                'bridges': len(bridges),
-                'articulation_points': len(articulation_points),
-                'critical_nodes_examples': [self.graph.nodes[n].get('name', n[:20] + '...') if self.graph.nodes[n].get('type') != 'CHUNK' else f"Chunk:{n[:8]}..." for n in articulation_points[:10]],
-                'top_betweenness_centrality': top_betweenness,
-                'top_closeness_centrality': top_closeness
-            }
+        except Exception as e:
+            logger.warning(f"Error calculating centrality measures: {e}. Returning empty lists for centrality.")
+            top_betweenness = []
+            top_closeness = []
+
+        return {
+            'average_degree': np.mean(degrees),
+            'degree_distribution': {
+                'min': min(degrees),
+                'max': max(degrees),
+                'mean': np.mean(degrees),
+                'median': np.median(degrees),
+                'std': np.std(degrees)
+            },
+            'bridges': len(bridges),
+            'articulation_points': len(articulation_points),
+            'critical_nodes_examples': [self.graph.nodes[n].get('name', n[:20] + '...') if self.graph.nodes[n].get('type') != 'CHUNK' else f"Chunk:{n[:8]}..." for n in articulation_points[:10]],
+            'top_betweenness_centrality': top_betweenness,
+            'top_closeness_centrality': top_closeness
+        }
 
     def _analyze_entity_coverage(self) -> Dict[str, Any]:
         """Analyze entity coverage across documents"""
@@ -384,7 +423,6 @@ class KnowledgeGapAnalyzer:
                     doc_entity_map[self.kg_manager.document_chunks[chunk_id].document_id].add(entity_id)
                 else:
                     logger.warning(f"Chunk ID {chunk_id} not found in kg_manager.document_chunks for entity {entity_id}. Skipping related document link.")
-
 
         # Find entities mentioned in multiple documents
         cross_document_entities = {e_id: docs for e_id, docs in entity_doc_map.items() if len(docs) > 1}
@@ -411,7 +449,7 @@ class KnowledgeGapAnalyzer:
 
         # Structural recommendations
         if structural.get('isolated_nodes', 0) > 0:
-            recommendations.append(f"Address {structural['isolated_nodes']} isolated nodes ({structural['isolated_node_list'][:3]}...) by adding more contextual information in new documents or by enriching existing ones. These nodes are not connected to the main graph.")
+            recommendations.append(f"Address {structural['isolated_nodes']} isolated nodes ({', '.join(structural['isolated_node_list'][:3])}...) by adding more contextual information in new documents or by enriching existing ones. These nodes are not connected to the main graph.")
 
         if structural.get('connectivity_ratio', 0) < 0.7:
             recommendations.append(f"Improve overall graph connectivity (ratio: {structural.get('connectivity_ratio', 0):.2%}) by ensuring entities and chunks have more cross-references. This will help retrieve more related information.")
@@ -425,7 +463,7 @@ class KnowledgeGapAnalyzer:
 
         # Connectivity recommendations
         if connectivity.get('articulation_points', 0) > 0:
-            recommendations.append(f"Strengthen connections around {connectivity['articulation_points']} critical nodes ({connectivity['critical_nodes_examples'][:3]}...). These nodes are crucial for graph connectivity, and their removal would partition the graph.")
+            recommendations.append(f"Strengthen connections around {connectivity['articulation_points']} critical nodes ({', '.join(connectivity['critical_nodes_examples'][:3])}...). These nodes are crucial for graph connectivity, and their removal would partition the graph.")
 
         if connectivity.get('bridges', 0) > 0:
             recommendations.append(f"There are {connectivity['bridges']} bridge edges. Consider adding redundant paths to connect the components linked by these bridges for improved robustness.")
@@ -435,7 +473,7 @@ class KnowledgeGapAnalyzer:
             recommendations.append(f"Only {coverage.get('cross_document_entities_count', 0)} entities appear in multiple documents. Add more documents that share common entities to improve knowledge linking and retrieval across your corpus.")
 
         if coverage.get('sparse_documents_count', 0) > 0:
-            recommendations.append(f"There are {coverage['sparse_documents_count']} documents ({coverage['sparse_document_examples'][:3]}...) with very few entities. Review these documents for better entity extraction or consider if they are truly relevant.")
+            recommendations.append(f"There are {coverage['sparse_documents_count']} documents ({', '.join(coverage['sparse_document_examples'][:3])}...) with very few entities. Review these documents for better entity extraction or consider if they are truly relevant.")
 
         if not recommendations:
             recommendations.append("Knowledge graph structure looks healthy, well-connected, and rich in entities!")
@@ -453,17 +491,27 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 ## Executive Summary
 {self._create_executive_summary(analysis)}
 
+---
+
 ## Structural Analysis
 {self._format_structural_analysis(analysis['structural_gaps'])}
+
+---
 
 ## Content Analysis
 {self._format_content_analysis(analysis['content_gaps'])}
 
+---
+
 ## Connectivity Analysis
 {self._format_connectivity_analysis(analysis['connectivity_gaps'])}
 
+---
+
 ## Entity Coverage Analysis
 {self._format_coverage_analysis(analysis['entity_coverage'])}
+
+---
 
 ## Recommendations
 {self._format_recommendations(analysis['recommendations'])}
@@ -471,9 +519,11 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
         if save_path:
             try:
+                # Ensure the directory for save_path exists
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
                 with open(save_path, 'w', encoding='utf-8') as f:
                     f.write(report)
-                logger.info(f"Knowledge gap report saved to {save_path}")
+                # logger.info(f"Knowledge gap report saved to {save_path}")
             except Exception as e:
                 logger.error(f"Error saving knowledge gap report to {save_path}: {e}")
 
@@ -482,43 +532,43 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
     def _create_executive_summary(self, analysis):
         structural = analysis.get('structural_gaps', {})
         return f"""
-The knowledge graph contains {structural.get('total_nodes', 0)} nodes and {structural.get('total_edges', 0)} edges.
-Graph connectivity ratio: {structural.get('connectivity_ratio', 0):.2%}
-Overall graph density: {structural.get('graph_density', 0):.4f}
+The knowledge graph contains **{structural.get('total_nodes', 0)} nodes** and **{structural.get('total_edges', 0)} edges**.
+Graph connectivity ratio: **{structural.get('connectivity_ratio', 0):.2%}**
+Overall graph density: **{structural.get('graph_density', 0):.4f}**
 """
 
     def _format_structural_analysis(self, structural):
         return f"""
-- Total nodes: {structural.get('total_nodes', 0)}
-- Total edges: {structural.get('total_edges', 0)}
-- Isolated nodes: {structural.get('isolated_nodes', 0)} ({', '.join(structural.get('isolated_node_list', []))})
-- Connected components: {structural.get('connected_components', 0)}
-- Largest component size: {structural.get('largest_component_size', 0)}
-- Graph density: {structural.get('graph_density', 0):.4f}
+- **Total nodes**: {structural.get('total_nodes', 0)}
+- **Total edges**: {structural.get('total_edges', 0)}
+- **Isolated nodes**: {structural.get('isolated_nodes', 0)} (Examples: {', '.join(structural.get('isolated_node_list', []))})
+- **Connected components**: {structural.get('connected_components', 0)}
+- **Largest component size**: {structural.get('largest_component_size', 0)}
+- **Graph density**: {structural.get('graph_density', 0):.4f}
 """
 
     def _format_content_analysis(self, content):
         return f"""
-- Total entities: {content.get('total_entities', 0)}
-- Total documents (chunks): {content.get('total_documents', 0)}
-- Average entities per document: {content.get('entities_per_document', 0):.2f}
-- Sparse entities (< 2 connections): {len(content.get('sparse_entities', []))} examples: {', '.join([e['name'] for e in content['sparse_entities'][:3]])}
-- Entity type distribution: {content.get('entity_type_distribution', {})}
+- **Total entities**: {content.get('total_entities', 0)}
+- **Total documents (chunks)**: {content.get('total_documents', 0)}
+- **Average entities per document**: {content.get('entities_per_document', 0):.2f}
+- **Sparse entities** (< 2 connections): {len(content.get('sparse_entities', []))} (Examples: {', '.join([e['name'] for e in content['sparse_entities'][:3]])})
+- **Entity type distribution**: {content.get('entity_type_distribution', {})}
 """
 
     def _format_connectivity_analysis(self, connectivity):
         return f"""
-- Average node degree: {connectivity.get('average_degree', 0):.2f}
-- Bridge connections: {connectivity.get('bridges', 0)}
-- Critical nodes (articulation points): {connectivity.get('articulation_points', 0)} ({', '.join(connectivity.get('critical_nodes_examples', []))})
-- Degree distribution: Min={connectivity.get('degree_distribution', {}).get('min', 'N/A')}, Max={connectivity.get('degree_distribution', {}).get('max', 'N/A')}, Mean={connectivity.get('degree_distribution', {}).get('mean', 'N/A'):.2f}, Median={connectivity.get('degree_distribution', {}).get('median', 'N/A'):.2f}, Std={connectivity.get('degree_distribution', {}).get('std', 'N/A'):.2f}
+- **Average node degree**: {connectivity.get('average_degree', 0):.2f}
+- **Bridge connections**: {connectivity.get('bridges', 0)}
+- **Critical nodes (articulation points)**: {connectivity.get('articulation_points', 0)} (Examples: {', '.join(connectivity.get('critical_nodes_examples', []))})
+- **Degree distribution**: Min={connectivity.get('degree_distribution', {}).get('min', 'N/A')}, Max={connectivity.get('degree_distribution', {}).get('max', 'N/A')}, Mean={connectivity.get('degree_distribution', {}).get('mean', 'N/A'):.2f}, Median={connectivity.get('degree_distribution', {}).get('median', 'N/A'):.2f}, Std={connectivity.get('degree_distribution', {}).get('std', 'N/A'):.2f}
 """
 
     def _format_coverage_analysis(self, coverage):
         return f"""
-- Cross-document entities: {coverage.get('cross_document_entities_count', 0)} (Examples: {', '.join(coverage.get('cross_document_entity_examples', []))})
-- Sparse documents (< 3 entities): {coverage.get('sparse_documents_count', 0)} (Examples: {', '.join(coverage.get('sparse_document_examples', []))})
-- Average entities per document (linked): {coverage.get('average_entities_per_document', 0):.2f}
+- **Cross-document entities**: {coverage.get('cross_document_entities_count', 0)} (Examples: {', '.join(coverage.get('cross_document_entity_examples', []))})
+- **Sparse documents** (< 3 entities): {coverage.get('sparse_documents_count', 0)} (Examples: {', '.join(coverage.get('sparse_document_examples', []))})
+- **Average entities per document (linked)**: {coverage.get('average_entities_per_document', 0):.2f}
 """
 
     def _format_recommendations(self, recommendations):
@@ -531,27 +581,31 @@ def analyze_rag_knowledge_graph(rag_system):
     visualizer = KnowledgeGraphVisualizer(rag_system.kg_manager)
     analyzer = KnowledgeGapAnalyzer(rag_system.kg_manager)
 
-    print("=== Knowledge Graph Analysis ===")
+    # print("\n--- Knowledge Graph Analysis ---")
 
     # 1. Create interactive visualization
-    print("Creating interactive visualization...")
+    print("Creating interactive visualization (saved to knowledge_graph_interactive.html)...")
+    # The visualize_graph_interactive function now handles saving to STORAGE_PATH
+    # and no longer calls fig.show()
     fig = visualizer.visualize_graph_interactive()
     if fig:
-        fig.show()
+        logger.info("Interactive visualization HTML file generated in your 'storage' directory.")
 
     # 2. Generate gap analysis report
-    print("\nGenerating gap analysis report...")
-    report = analyzer.create_gap_report("knowledge_gap_report.md")
+    print("\nGenerating comprehensive gap analysis report...")
+    report_save_path = os.path.join(os.getenv("STORAGE_PATH", "./storage"), "knowledge_gap_report.md")
+    report = analyzer.create_gap_report(report_save_path)
+    print("Knowledge gap report saved to knowledge_gap_report.md")
     # print(report)
 
-    # 3. Get detailed analysis
+    # 3. Get detailed analysis (returned by this function if needed elsewhere)
     detailed_analysis = analyzer.analyze_gaps()
 
     return {
-        'visualization': fig,
-        'gap_analysis': detailed_analysis,
-        'report': report
+        'visualization_figure': fig, # The Plotly figure object (can be None if generation failed)
+        'gap_analysis_data': detailed_analysis,
+        'report_content': report
     }
 
 if __name__ == "__main__":
-    pass
+    logger.info("Run `docker-compose up` to trigger RAG system initialization and graph analysis.")

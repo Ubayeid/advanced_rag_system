@@ -1,4 +1,4 @@
-version: '3.8' # The 'version' attribute is considered obsolete in newer Docker Compose versions, but it's fine to keep for compatibility. You can remove it if you wish.
+# version: '3.8' # The 'version' attribute is considered obsolete in newer Docker Compose versions, but it's fine to keep for compatibility. You can remove it if you wish.
 
 services:
   ciroh-rag:

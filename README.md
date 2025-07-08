@@ -1,264 +1,121 @@
-# Hybrid RAG System: Semantic Retrieval and Knowledge Graph Augmented Generation
+# CIROH RAG System
 
-## Overview
+A modular, production-ready Retrieval-Augmented Generation (RAG) system for hydrological and scientific document QA, featuring hybrid vector and knowledge graph retrieval, gap analysis, and interactive visualization.
 
-This project implements a sophisticated Retrieval Augmented Generation (RAG) system that combines vector-based semantic search with a structured Knowledge Graph (KG) for enhanced information retrieval and accurate, context-aware answer generation.
-
-Unlike traditional RAG systems that rely solely on vector similarity, this hybrid approach leverages a Knowledge Graph to:
-
-  * Identify and extract entities and relations from documents.
-  * Enrich retrieved content with semantically related information.
-  * Improve the relevance and interconnectedness of context provided to the Large Language Model (LLM).
-
-The system is designed for local deployment, offering persistence for its knowledge base components (FAISS index, Knowledge Graph) to avoid re-processing documents on every run unless the source data changes.
+---
 
 ## Features
 
-  * **Hybrid Retrieval:** Combines:
-      * **Vector Search:** Utilizes Sentence Transformers (default `all-MiniLM-L6-v2`) and FAISS for efficient semantic similarity search on document chunks.
-      * **Knowledge Graph Augmentation:** Leverages a NetworkX-based Knowledge Graph to extract entities (using SpaCy's NER and custom rules) and relations, boosting retrieval scores for semantically connected information.
-  * **Intelligent Document Processing:**
-      * Handles both plain text (`.txt` files) and PDF (`.pdf` files).
-      * Employs `pypdf` for robust PDF text extraction.
-      * Includes a `_clean_text` function with advanced regex patterns to remove PDF artifacts and noise.
-      * Implements a recursive, token-aware chunking strategy with configurable overlap.
-      * Extracts keywords using TF-IDF.
-  * **Knowledge Graph Construction:**
-      * Automatically builds a directed multigraph (`networkx.MultiDiGraph`) of entities, relations, and document chunks.
-      * Identifies entities using SpaCy's pre-trained models and custom, hydrology-specific `PhraseMatcher` rules.
-      * Extracts relations using SpaCy's `Matcher` with rule-based patterns and falls back to co-occurrence for broader connections.
-  * **LLM Integration:** Connects to OpenAI's API (default `gpt-3.5-turbo`) to generate coherent and factual answers based *only* on the retrieved context.
-  * **Persistence & Cache:**
-      * Automatically saves/loads the FAISS index, KG, and all metadata to/from disk (`./storage` directory).
-      * Detects changes in the `./data` directory to trigger full re-processing, otherwise loads the cached knowledge base for quick startup.
-  * **Interactive Query Interface:** Provides a simple command-line interface for querying the RAG system.
-  * **Knowledge Graph Analysis & Visualization:**
-      * Generates a comprehensive Markdown report (`knowledge_gap_report.md`) detailing structural, content, and connectivity gaps in the KG.
-      * Creates an interactive Plotly visualization of the Knowledge Graph saved as an HTML file (`knowledge_graph_interactive.html`).
+- **Hybrid Retrieval:** Combines vector search (FAISS) and knowledge graph traversal for robust, context-aware retrieval.
+- **Knowledge Graph:** Entity and relation extraction, gap analysis, and interactive visualization (Plotly, Matplotlib).
+- **Document Processing:** Supports PDF and TXT ingestion, chunking, and embedding.
+- **LLM Integration:** Uses OpenAI GPT models for answer generation with strict source citation.
+- **REST API:** Flask-based API with endpoints for querying and system stats.
+- **Dockerized:** Easy deployment with Docker and Docker Compose.
+- **Configurable:** Environment variables for model selection, chunking, and more.
 
-## Future Development
+---
 
-This project is actively under development with the following exciting next steps:
-
-  * **Zotero Database Integration:** The next major step will involve linking the CIROH database (likely managed via Zotero) directly with the project. This will allow for seamless ingestion of research papers and other relevant documents.
-  * **User Interface (UI) Development:** A user-friendly graphical interface will be developed to enhance interaction with the RAG system, making it more accessible for users to input queries and visualize results.
-  * **Evaluation:** Comprehensive evaluation metrics and methodologies will be implemented to rigorously assess the performance, accuracy, and efficiency of the RAG system.
-
-## Installation
-
-1.  **Clone the repository:**
-
-    ```bash
-    git clone <your-repository-url>
-    cd <your-project-directory> # e.g., ciroh_new
-    ```
-
-2.  **Create a Python Virtual Environment (recommended):**
-
-    ```bash
-    python3 -m venv venv
-    source venv/bin/activate
-    ```
-
-3.  **Install Python Dependencies:**
-
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-4.  **Download SpaCy Language Model:**
-
-    ```bash
-    python -m spacy download en_core_web_sm
-    ```
-
-5.  **Set up Environment Variables:**
-    Create a `.env` file in the root of your project directory (`ciroh_new/`) and add your OpenAI API key and other configurations:
-
-    ```ini
-    # .env
-    OPENAI_API_KEY="YOUR_OPENAI_API_KEY" # Required for LLM generation
-    EMBEDDING_MODEL_NAME="all-MiniLM-L6-v2" # Sentence Transformer model for embeddings
-    EMBEDDING_DIM=384 # Dimension for all-MiniLM-L6-v2
-    LLM_MODEL_NAME="gpt-3.5-turbo" # LLM for answer generation
-    LLM_TEMPERATURE=0.7
-    LLM_MAX_TOKENS_CONTEXT=4000
-    LLM_MAX_TOKENS_RESPONSE=1000
-    TARGET_CHUNK_SIZE_TOKENS=512
-    CHUNK_OVERLAP_SENTENCES=2
-    MIN_CHUNK_SIZE_TOKENS=20
-    STORAGE_PATH="./storage"
-    DATA_PATH="./data" # Points to the directory where you'll put your documents
-    ENABLE_CACHE="true"
-    CACHE_DIR="./cache"
-    MAX_CONCURRENT_REQUESTS=10
-    REQUEST_TIMEOUT=60
-    CACHE_VALIDITY_DAYS=1
-    SPACY_MODEL="en_core_web_sm"
-    ```
-
-## Running with Docker
-
-You can run this project using Docker for a consistent and isolated environment. There are two main ways to use Docker:
-
-### 1. Using Docker Compose (Recommended)
-
-This is the easiest way if you want to manage environment variables and scale to multiple services in the future.
-
-1. **Build the Docker image and start the container:**
-
-    ```bash
-    docker-compose build
-    docker-compose up
-    ```
-
-2. **Environment Variables:**
-    - Create a `.env` file in your project root (see the example in the Installation section above).
-    - Docker Compose will automatically load environment variables from this file.
-
-3. **Stopping the container:**
-
-    ```bash
-    docker-compose down
-    ```
-
-### 2. Using Docker Directly
-
-If you prefer to use Docker without Compose:
-
-1. **Build the Docker image:**
-
-    ```bash
-    docker build -t hybrid-rag .
-    ```
-
-2. **Run the container:**
-
-    ```bash
-    docker run --rm -it \
-      -v $(pwd)/data:/app/data \
-      -v $(pwd)/storage:/app/storage \
-      -v $(pwd)/cache:/app/cache \
-      --env-file .env \
-      -p 8000:8000 \
-      hybrid-rag
-    ```
-    - This mounts your local `data`, `storage`, and `cache` directories into the container for persistence.
-    - The `--env-file .env` flag loads environment variables from your `.env` file.
-    - The `-p 8000:8000` flag exposes port 8000 if you use the web interface.
-
-3. **Stopping the container:**
-    - Press `Ctrl+C` in the terminal, or run `docker stop <container_id>` from another terminal.
-
-### Notes
-- Make sure your `data` directory contains your source documents before starting the container.
-- The output files (e.g., `knowledge_graph_interactive.html`, `knowledge_gap_report.md`) will be available in your project directory after the container runs.
-- If you change your data, simply restart the container to reprocess and update the knowledge base.
-
-## Usage
-
-### 1\. Prepare Your Data
-
-**The `./data` directory included in this repository serves as a placeholder.** To use the RAG system, you need to add your own source documents (plain text `.txt` files or PDF `.pdf` files) into this `./data` directory. For instance, you could place a research paper on hydrology here.
-
-### 2\. Run the System
-
-The project uses a `Dockerfile` for convenient execution.
-
-```bash
-docker-compose build
-docker-compose up
-```
-
-This command will:
-
-  * Activate the virtual environment.
-  * Initialize the RAG system.
-  * **If your data has changed (or it's the first run):** It will re-process all documents from the `./data` directory, build/update the FAISS index and Knowledge Graph, and save them to the `./storage` directory.
-  * **If your data has not changed:** It will quickly load the pre-built knowledge base from `./storage`.
-  * Generate the Knowledge Graph analysis report (`knowledge_gap_report.md`) and save it.
-  * Generate the interactive Knowledge Graph visualization (`knowledge_graph_interactive.html`) and save it.
-  * Start an interactive command-line interface for you to query the system.
-
-### 3\. View the Knowledge Graph Visualization
-
-After running `docker-compose up`, you will see messages indicating that the interactive graph HTML file has been saved:
+## Directory Structure
 
 ```
-Interactive knowledge graph saved to 'knowledge_graph_interactive.html' in your project directory.
-Please open this file manually in your web browser.
+ciroh_new/
+├── main.py                # Core RAG components and logic
+├── web_server.py          # Flask API server and RAG system initialization
+├── knowledge_graph.py     # Knowledge graph visualization and gap analysis
+├── requirements.txt       # Python dependencies
+├── Dockerfile             # Docker build instructions
+├── docker-compose.yml     # Multi-container orchestration
+├── data/                  # Input documents (PDF/TXT)
+├── storage/               # Persisted vector index, KG, and reports
+├── cache/                 # Optional cache for embeddings, etc.
+└── README.md              # This file
 ```
 
-To view the interactive graph:
+---
 
-1.  Open your **Windows File Explorer**.
-2.  Navigate to your project's root directory (e.g., `C:\Users\mduba\Development\projects\ai\hybrid\ciroh_new\`).
-3.  Double-click on `knowledge_graph_interactive.html`. It will open in your default web browser.
+## Quick Start
 
-### 4\. View the Knowledge Graph Analysis Report
+### 1. Prepare Data
 
-The detailed markdown report is saved to:
+- Place your PDF or TXT documents in the `data/` directory.
 
-  * `./knowledge_gap_report.md`
+### 2. Set Environment Variables
 
-You can open this file with any text editor or a Markdown viewer.
+Create a `.env` file in the project root (or set variables in your shell):
 
-### 5\. Query the System
-
-In the terminal where you ran `docker-compose up` (or your chosen Docker run command), you'll see a `Query>` prompt.
-
-```
-Enter your query (type 'exit' to quit):
-Query> What is an academic paper knowledge graph?
+```env
+OPENAI_API_KEY=your-openai-api-key
+EMBEDDING_MODEL_NAME=all-MiniLM-L6-v2
+LLM_MODEL_NAME=gpt-3.5-turbo
+# ...other variables as needed (see docker-compose.yml)...
 ```
 
-Type your questions and press Enter. The system will retrieve relevant information, generate an answer, and provide source attribution and confidence scores.
+### 3. Build and Run with Docker Compose
 
-### 6\. Managing Data Changes
-
-If you modify, add, or remove documents in the `./data` directory, simply stop and restart the Docker container (using `docker-compose up` or your Docker run command). The system will automatically detect the changes (via a hash check of the data directory) and re-process everything, ensuring your knowledge base is always up-to-date.
-
-## Project Structure
-
+```sh
+docker-compose up --build
 ```
-.
-├── main.py                     # Main application logic and RAG system orchestration
-├── knowledge_graph.py          # Classes for Knowledge Graph visualization and analysis
-├── requirements.txt            # Python dependencies
-├── .env                        # Environment variables (API keys, configurations)
-├── Makefile                    # Automation for running the project
-├── data/                       # Directory for raw input documents (PLACE YOUR .txt OR .pdf FILES HERE)
-├── storage/                    # Directory for processed/cached knowledge base components
-│   ├── faiss_index.bin         # Stored FAISS vector index
-│   ├── chunk_metadata.json     # Metadata for all document chunks
-│   ├── id_to_index.json        # Mapping of chunk IDs to FAISS indices
-│   ├── index_to_id.json        # Mapping of FAISS indices to chunk IDs
-│   ├── kg_graph.gml            # NetworkX Knowledge Graph in GML format
-│   ├── kg_entities.json        # JSON serialization of KnowledgeEntity objects
-│   ├── kg_relations.json       # JSON serialization of KnowledgeRelation objects
-│   ├── kg_chunks.json          # JSON serialization of DocumentChunk objects (metadata only)
-│   └── data_hash.txt           # Hash of the 'data' directory for change detection
-└── # ... other project files ...
-```
+
+- The API will be available at [http://localhost:8000](http://localhost:8000)
+
+### 4. Access the Web UI
+
+- Open [http://localhost:8000](http://localhost:8000) in your browser for the chat interface.
+
+---
+
+## API Endpoints
+
+- `POST /query`  
+  **Body:** `{ "query": "your question here" }`  
+  **Response:** JSON with answer, confidence, sources, and query analysis.
+
+- `GET /stats`  
+  Returns system statistics (index size, KG nodes/edges, etc.).
+
+---
+
+## Knowledge Graph Visualization & Gap Analysis
+
+- After document processing, an interactive knowledge graph HTML and a gap analysis report are generated in the `storage/` directory.
+- Visualization generation can be toggled with the `GENERATE_KG_VISUALIZATION` environment variable.
+
+---
 
 ## Troubleshooting
 
-  * **`ModuleNotFoundError: No module named 'pypdf'` (or other package):**
-      * Ensure your virtual environment is activated (`source venv/bin/activate`).
-      * Run `pip install -r requirements.txt`.
-  * **`SyntaxError` in `knowledge_graph.py`:**
-      * Carefully review the exact line number indicated in the traceback. This is usually due to a typo or a duplicated keyword argument (e.g., `x=` or `y=`) in a dictionary or function call.
-  * **`Invalid property specified for object of type plotly.graph_objs.Layout: 'titlefont'` (or similar Plotly errors):**
-      * Check Plotly's documentation for the correct parameter names. Ensure `titlefont_size` is replaced with `title=dict(font=dict(size=...))`.
-  * **`xdg-open: not found` or `no method available for opening 'http://127.0.0.1:XXXX'`:**
-      * This means your WSL environment cannot automatically launch a web browser. The HTML file *is* being created successfully.
-      * **Manually open** `knowledge_graph_interactive.html` from your Windows File Explorer in the project directory.
-      * (Optional) To try and enable `xdg-open` in WSL, you might need to install `xdg-utils`: `sudo apt install xdg-utils`.
-  * **"I cannot answer the question based on the given information." for a relevant query:**
-      * Verify the content in your `./data` directory actually contains the answer.
-      * Check your `_clean_text` function in `main.py` for overly aggressive cleaning that might be removing important content.
-      * Temporarily add `logger.info` statements in `HybridRetrievalEngine.retrieve` and `ResponseGenerator.generate_response` to inspect `retrieved_chunks` and `full_context` to see what information the LLM is receiving.
-  * **Nonsensical entities/keywords in `Sources Used`:**
-      * Refine the `_clean_text` regex patterns in `main.py` to better filter out PDF artifacts (e.g., page numbers, internal metadata, OCR errors).
+- If you see **"RAG system not initialized"** or **"RAG system is not ready"**:
+  - Check the container logs for errors (`docker logs ciroh-rag-system`).
+  - Ensure all environment variables and required models are available.
+  - Make sure your `data/` directory contains at least one valid document.
 
------
+- To debug initialization:
+  - Enter the container:  
+    `docker exec -it ciroh-rag-system /bin/bash`
+  - Run:  
+    `python main.py`  
+    (Add debug code to `main.py` if needed.)
+
+---
+
+## Development Notes
+
+- All core logic is in `main.py` (retrieval, embedding, KG, etc.).
+- The Flask API and RAG system initialization are in `web_server.py`.
+- Knowledge graph analysis and visualization are in `knowledge_graph.py`.
+- The system expects documents in `data/` and persists processed data in `storage/`.
+
+---
+
+## License
+
+MIT License (add your license here)
+
+---
+
+## Acknowledgments
+
+- [spaCy](https://spacy.io/)
+- [FAISS](https://github.com/facebookresearch/faiss)
+- [OpenAI GPT](https://platform.openai.com/)

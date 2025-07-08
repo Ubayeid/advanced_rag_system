@@ -15,3 +15,4 @@ matplotlib
 sentence-transformers
 pypdf
 Flask>=2.0
+Flask-Cors

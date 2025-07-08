@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>CIROH RAG Chatbot</title>
+    <title>RAG Chatbot</title>
     <style>
         body {
             background: #f0f4f9;
@@ -135,27 +135,43 @@
         async function sendMessage() {
             const text = userInput.value.trim();
             if (!text) return;
-            appendMessage('user', text);
-            userInput.value = '';
-            sendBtn.disabled = true;
+            appendMessage('user', text); // Display user's message immediately
+            userInput.value = ''; // Clear input field
+            sendBtn.disabled = true; // Disable button to prevent multiple submissions
+
             try {
-                const res = await fetch('/chat', {
+                const res = await fetch('/query', { // CORRECTED: Changed '/chat' to '/query'
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: text })
+                    body: JSON.stringify({ query: text }) // CORRECTED: Changed 'message' to 'query'
                 });
+
+                // Check if the response was successful (e.g., status 200 OK)
+                if (!res.ok) {
+                    const errorText = await res.text(); // Get potential error message from server
+                    throw new Error(`Server error: ${res.status} ${res.statusText} - ${errorText}`);
+                }
+
                 const data = await res.json();
-                appendMessage('bot', data.answer || data.error || 'No response');
+
+                // Display the bot's answer, falling back to error or generic message
+                appendMessage('bot', data.answer || data.error || 'Received an empty response from bot.');
+
             } catch (e) {
-                appendMessage('bot', 'Error connecting to server.');
+                console.error("Fetch error:", e); // Log the detailed error to console
+                appendMessage('bot', 'Error connecting to server or processing response. Please check console.');
+            } finally { // This block always executes, whether try or catch happened
+                sendBtn.disabled = false; // Re-enable button
+                userInput.focus(); // Focus input for next message
             }
-            sendBtn.disabled = false;
-            userInput.focus();
         }
 
-        chatForm.onsubmit = sendMessage;
+        chatForm.onsubmit = sendMessage; // Trigger sendMessage when form is submitted
         userInput.addEventListener('keydown', function(e) {
-            if (e.key === 'Enter') sendMessage();
+            if (e.key === 'Enter' && !sendBtn.disabled) { // Also trigger on Enter key, only if not disabled
+                sendMessage();
+                e.preventDefault(); // Prevent default form submission behavior (page reload)
+            }
         });
     </script>
 </body>

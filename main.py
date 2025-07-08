@@ -49,7 +49,7 @@ EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2") # D
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384")) # Default dimension for all-MiniLM-L6-v2
 
 # LLM Model Configuration (for answer generation via OpenAI API)
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "gpt-3.5-turbo")
+LLM_MODEL_NAME = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 LLM_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.7"))
 LLM_MAX_TOKENS_CONTEXT = int(os.getenv("LLM_MAX_TOKENS_CONTEXT", "4000")) # Max input tokens for LLM
 LLM_MAX_TOKENS_RESPONSE = int(os.getenv("LLM_MAX_TOKENS_RESPONSE", "1000")) # Max output tokens for LLM response
@@ -73,7 +73,7 @@ KG_ENTITIES_PATH = STORAGE_PATH / "kg_entities.json"
 KG_RELATIONS_PATH = STORAGE_PATH / "kg_relations.json"
 LAST_DATA_HASH_PATH = STORAGE_PATH / "data_hash.txt"
 KG_CHUNKS_PATH = STORAGE_PATH / "kg_chunks.json"
-
+# DOCUMENT_HASHES_PATH = STORAGE_PATH / "document_hashes.json"
 # System Settings
 ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true"
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "./cache"))
@@ -421,134 +421,181 @@ class DocumentProcessor:
 
     def _create_chunks_with_metadata_inference(self, content: str, doc_id: str) -> List[DocumentChunk]:
         """
-        Creates overlapping chunks, attempting to infer section/page metadata
-        from the document's raw content, especially for PDF-derived text.
-        This is a heuristic approach for the provided PDF format with '--- PAGE X ---' markers.
-        For robust parsing, consider a dedicated PDF structure extraction library.
+        Creates overlapping chunks, attempting to infer section/page metadata from the document's raw content, especially for PDF-derived text.
         """
-        chunks = []
-        chunk_index = 0
-
-        # Initial defaults for metadata
-        current_section_title = "Document Introduction"
-        current_subsection_title = None
-        current_page_number = 1
+        all_final_chunks = [] # Stores all chunks from the entire document
+        global_chunk_index = 0 # Unique index across all chunks in the document
 
         EMBEDDING_MODEL_HARD_MAX_TOKENS = self.embedding_service.EMBEDDING_MODEL_MAX_TOKENS
         FALLBACK_CHAR_CHUNK_SIZE = int(EMBEDDING_MODEL_HARD_MAX_TOKENS * 0.9)
 
         # Split content by explicit page markers
+        # The pattern (r'\n\s*--- PAGE (\d+) ---\s*\n') means:
+        # - Group 1 captures the page number.
+        # - The split result will be [pre-page-1-content, page-1-number, page-1-content, page-2-number, page-2-content, ...]
         page_splits = re.split(r'\n\s*--- PAGE (\d+) ---\s*\n', content)
 
-        # Start with content before first page marker, if any.
-        segment_to_process = page_splits[0]
+        # Process content before the first page marker (if any)
+        if page_splits[0].strip():
+            # Initial metadata for content before first page marker
+            current_section_title = "Document Introduction"
+            current_subsection_title = None
+            current_page_number = 0 # Or 1, depending on how you want to number pre-page content
 
-        # Iterate through detected pages and their content
+            chunks_from_segment = self._process_single_content_segment(
+                doc_id, page_splits[0],
+                current_section_title, current_subsection_title, current_page_number,
+                EMBEDDING_MODEL_HARD_MAX_TOKENS, FALLBACK_CHAR_CHUNK_SIZE,
+                global_chunk_index # Pass starting chunk index
+            )
+            all_final_chunks.extend(chunks_from_segment)
+            if chunks_from_segment:
+                global_chunk_index = chunks_from_segment[-1].chunk_index + 1
+
+        # Iterate through detected pages and their content (page_splits[1] is page number, page_splits[2] is content, etc.)
         for i in range(1, len(page_splits), 2):
             page_num_str = page_splits[i].strip()
-            page_content = page_splits[i+1]
+            page_content = page_splits[i+1].strip() # Get content for THIS page
 
             try:
                 current_page_number = int(page_num_str)
             except ValueError:
-                logger.warning(f"Could not parse page number from '{page_num_str}' in {doc_id}. Keeping previous page number.")
+                logger.warning(f"Could not parse page number from '{page_num_str}' in {doc_id}. Keeping previous page number for safety.")
+                # If cannot parse, maybe use the last known page number or a default.
+                # For robustness, let's ensure current_page_number is always an int
+                current_page_number = current_page_number # Retain previous, or set a default like 1
 
-            segment_to_process += page_content
+            if not page_content: # Skip empty page content
+                continue
 
-            lines = segment_to_process.split('\n')
-            new_segment_lines = []
+            # Reset section/subsection titles for each new page unless explicitly carried over
+            # For simplicity, assuming new page potentially means new section starts unless context dictates otherwise
+            current_section_title = "Page Content" # Default for a new page
+            current_subsection_title = None
 
+            lines = page_content.split('\n')
+            
+            # Re-evaluate section/subsection headers within each page
+            processed_lines = []
             for line in lines:
                 stripped_line = line.strip()
-                # Check for main section headers (e.g., "1. DATA STRUCTURES", "Discussion", "Methods", "Results")
+                if not stripped_line:
+                    continue # Skip empty lines
+
+                # Heuristic for main section headers (e.g., "1. DATA STRUCTURES")
+                # This regex is quite broad, might need refinement
                 if re.fullmatch(r'([A-Z\s&]+|\d+\.\s[A-Z\s&]+)', stripped_line) and len(stripped_line) < 50:
                     current_section_title = stripped_line
-                    current_subsection_title = None # Reset subsection when new main section
-                # Check for subsection headers (e.g., "RI definition and detection")
+                    current_subsection_title = None
+                # Heuristic for subsection headers (e.g., "RI definition and detection")
                 elif re.fullmatch(r'[\w\s&-]+', stripped_line) and stripped_line.istitle() and len(stripped_line.split()) < 8 and len(stripped_line) < 80:
-                    # Avoid capturing very short lines or common words
-                    if stripped_line not in ["Article", "Check for updates", "Summary", "Figure 1", "Figure 2", "Figure 3", "Figure 4", "Figure 5", "Figure 6", "Figure 7", "Figure 8", "Figure 9"]: # Blacklist common non-headers from 11_HQNY92RR.pdf
+                    # Blacklist common non-headers from your PDF example
+                    if stripped_line.lower() not in ["article", "check for updates", "summary", "figure 1", "figure 2", "figure 3", "figure 4", "figure 5", "figure 6", "figure 7", "figure 8", "figure 9"]:
                         current_subsection_title = stripped_line
+                
+                processed_lines.append(line) # Use original line to preserve formatting for chunking
 
-                new_segment_lines.append(line) # Rebuild segment to pass to splitter
-
-            # Now apply recursive splitting
-            pre_overlap_chunks_for_segment = self._recursive_split_for_metadata_helper(
-                "\n".join(new_segment_lines), # Use the potentially updated segment
-                ["\n\n\n", "\n\n", ". ", "? ", "! ", " "], # Using all separators
-                EMBEDDING_MODEL_HARD_MAX_TOKENS,
-                FALLBACK_CHAR_CHUNK_SIZE
+            # Process this page's content
+            chunks_from_segment = self._process_single_content_segment(
+                doc_id, "\n".join(processed_lines),
+                current_section_title, current_subsection_title, current_page_number,
+                EMBEDDING_MODEL_HARD_MAX_TOKENS, FALLBACK_CHAR_CHUNK_SIZE,
+                global_chunk_index # Pass starting chunk index
             )
+            all_final_chunks.extend(chunks_from_segment)
+            if chunks_from_segment:
+                global_chunk_index = chunks_from_segment[-1].chunk_index + 1
 
-            # Apply overlap and add to final chunks list, associating metadata
-            current_overlap_sentences_buffer = []
-            current_combined_chunk_content = []
-            current_combined_chunk_tokens = 0
+        logger.info(f"Document {doc_id} split into {len(all_final_chunks)} chunks with inferred metadata.")
+        return all_final_chunks
 
-            for pre_chunk_content in pre_overlap_chunks_for_segment:
-                # Robust sentence segmentation (from original method)
-                if self.nlp:
-                    doc_pre_chunk = self.nlp(pre_chunk_content)
-                    sentences_from_pre_chunk = [sent.text.strip() for sent in doc_pre_chunk.sents if sent.text.strip()]
+    def _process_single_content_segment(self, doc_id: str, segment_content: str,
+                                        section_title: str, subsection_title: Optional[str], page_number: Optional[int],
+                                        max_tokens: int, fallback_char_size: int,
+                                        start_chunk_index: int) -> List[DocumentChunk]:
+        """
+        Helper method to process a single continuous content segment (e.g., a page or a pre-page block)
+        into overlapping chunks, maintaining a consistent metadata context.
+        """
+        segment_chunks = []
+
+        pre_overlap_chunks = self._recursive_split_for_metadata_helper(
+            segment_content,
+            ["\n\n\n", "\n\n", ". ", "? ", "! ", " "],
+            max_tokens,
+            fallback_char_size
+        )
+
+        current_overlap_sentences_buffer = []
+        current_combined_chunk_content = []
+        current_combined_chunk_tokens = 0
+        chunk_idx_for_segment = start_chunk_index
+
+        for pre_chunk_content in pre_overlap_chunks:
+            if not pre_chunk_content.strip():
+                continue
+
+            if self.nlp:
+                doc_pre_chunk = self.nlp(pre_chunk_content)
+                sentences_from_pre_chunk = [sent.text.strip() for sent in doc_pre_chunk.sents if sent.text.strip()]
+            else:
+                sentences_from_pre_chunk = [s.strip() for s in re.split(r'(?<=[.?!])\s+', pre_chunk_content) if s.strip()]
+
+            for sent in sentences_from_pre_chunk:
+                if not sent.strip(): # Skip empty sentences
+                    continue
+
+                sent_tokens = len(self.tokenizer.encode(sent))
+
+                # Check if adding this sentence exceeds target chunk size
+                if current_combined_chunk_tokens + sent_tokens > self.target_chunk_size_tokens:
+                    if current_combined_chunk_content: # Ensure there's content to save
+                        final_chunk_text = " ".join(current_combined_chunk_content)
+                        final_chunk_tokens = len(self.tokenizer.encode(final_chunk_text))
+
+                        if final_chunk_tokens >= self.min_chunk_size_tokens:
+                            segment_chunks.append(DocumentChunk(
+                                id=str(uuid.uuid4()),
+                                document_id=doc_id,
+                                content=final_chunk_text,
+                                chunk_index=chunk_idx_for_segment,
+                                section_title=section_title,
+                                subsection_title=subsection_title,
+                                page_number=page_number
+                            ))
+                            chunk_idx_for_segment += 1
+                        else:
+                            logger.debug(f"Skipping small chunk {chunk_idx_for_segment} from {doc_id}: {final_chunk_tokens} tokens.")
+
+                    # Start new chunk with overlap and current sentence
+                    current_combined_chunk_content = list(current_overlap_sentences_buffer)
+                    current_combined_chunk_content.append(sent)
+                    current_combined_chunk_tokens = len(self.tokenizer.encode(" ".join(current_combined_chunk_content)))
+                    current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:]
                 else:
-                    sentences_from_pre_chunk = [s.strip() for s in re.split(r'(?<=[.?!])\s+', pre_chunk_content) if s.strip()]
+                    current_combined_chunk_content.append(sent)
+                    current_combined_chunk_tokens += sent_tokens
+                    current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:]
 
-                for sent in sentences_from_pre_chunk:
-                    sent_tokens = len(self.tokenizer.encode(sent))
-
-                    # Check if adding this sentence exceeds target chunk size
-                    if current_combined_chunk_tokens + sent_tokens > self.target_chunk_size_tokens:
-                        if current_combined_chunk_content: # Ensure there's content to save
-                            final_chunk_text = " ".join(current_combined_chunk_content)
-                            final_chunk_tokens = len(self.tokenizer.encode(final_chunk_text))
-
-                            if final_chunk_tokens >= self.min_chunk_size_tokens or not chunks:
-                                chunks.append(DocumentChunk(
-                                    id=str(uuid.uuid4()),
-                                    document_id=doc_id,
-                                    content=final_chunk_text,
-                                    chunk_index=chunk_index,
-                                    section_title=current_section_title, # NEW: Add metadata
-                                    subsection_title=current_subsection_title, # NEW
-                                    page_number=current_page_number # NEW
-                                ))
-                                chunk_index += 1
-                            else:
-                                logger.debug(f"Skipping chunk {chunk_index} from {doc_id} due to small size: {final_chunk_tokens} tokens.")
-
-                        # Start new chunk with overlap and current sentence
-                        current_combined_chunk_content = list(current_overlap_sentences_buffer)
-                        current_combined_chunk_content.append(sent)
-                        current_combined_chunk_tokens = len(self.tokenizer.encode(" ".join(current_combined_chunk_content)))
-                        current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:]
-                    else:
-                        current_combined_chunk_content.append(sent)
-                        current_combined_chunk_tokens += sent_tokens
-                        current_overlap_sentences_buffer = current_combined_chunk_content[-self.chunk_overlap_sentences:]
-
-            # Reset segment_to_process for the next page
-            segment_to_process = ""
-
-        # Add the very last remaining chunk (after all pages processed)
+        # Add the very last remaining chunk from this segment
         if current_combined_chunk_content:
             final_chunk_text = " ".join(current_combined_chunk_content)
             final_chunk_tokens = len(self.tokenizer.encode(final_chunk_text))
 
-            if final_chunk_tokens > 0:
-                chunks.append(DocumentChunk(
+            if final_chunk_tokens >= self.min_chunk_size_tokens: # Check min size for last chunk too
+                segment_chunks.append(DocumentChunk(
                     id=str(uuid.uuid4()),
                     document_id=doc_id,
                     content=final_chunk_text,
-                    chunk_index=chunk_index,
-                    section_title=current_section_title, # NEW
-                    subsection_title=current_subsection_title, # NEW
-                    page_number=current_page_number # NEW
+                    chunk_index=chunk_idx_for_segment,
+                    section_title=section_title,
+                    subsection_title=subsection_title,
+                    page_number=page_number
                 ))
             else:
-                logger.debug(f"Skipping final chunk from {doc_id} due to empty content.")
+                logger.debug(f"Skipping final small chunk {chunk_idx_for_segment} from {doc_id}: {final_chunk_tokens} tokens.")
 
-        logger.info(f"Document {doc_id} split into {len(chunks)} chunks with inferred metadata.")
-        return chunks
+        return segment_chunks
 
     def _recursive_split_for_metadata_helper(self, text: str, current_separators: List[str], max_tokens: int, fallback_char_size: int) -> List[str]:
         """Helper for recursive splitting, extracted from the original _create_chunks logic."""
@@ -924,7 +971,6 @@ class DocumentProcessor:
                                 extracted_relations_set.add((relation.source_entity, relation.target_entity, relation.relation_type))
         return relations, entities
 
-
 # 4. VECTOR INDEX MANAGER
 # =============================================================================
 
@@ -937,8 +983,8 @@ class VectorIndexManager:
         self.index_to_id: Dict[int, str] = {}
         self.current_index = 0
 
-        self.nlist = 100 # Number of inverted lists (clusters).
-        self.nprobe = 10 # Number of lists to search at query time. Higher = more accurate, slower.
+        self.nlist = 15 # Number of inverted lists (clusters). [future: 100]
+        self.nprobe = 5 # Number of lists to search at query time. Higher = more accurate, slower. [future: 20]
         self.training_vectors_limit = 10000 # Max number of vectors to use for training the index.
 
         self._initialize_index()
@@ -1211,9 +1257,95 @@ class KnowledgeGraphManager:
                     seen_nodes.add(target_node)
         return related_info
 
+    def add_data(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity], relations: List[KnowledgeRelation]):
+        """Add entities, relations, and chunks to the graph."""
+
+        for chunk in chunks:
+            if chunk.id not in self.document_chunks:
+                self.document_chunks[chunk.id] = chunk
+
+            # Ensure attributes are GML-compatible (strings, not None)
+            chunk_attrs = {
+                'type': 'CHUNK',
+                'content': chunk.content[:200] + '...',
+                'document_id': chunk.document_id,
+                'chunk_index': str(chunk.chunk_index), # Convert int to string for GML
+                'section_title': chunk.section_title if chunk.section_title is not None else "N/A", # Handle None
+                'subsection_title': chunk.subsection_title if chunk.subsection_title is not None else "N/A", # Handle None
+                'page_number': str(chunk.page_number) if chunk.page_number is not None else "N/A" # Convert int to string, handle None
+            }
+            self.graph.add_node(chunk.id, **chunk_attrs)
+
+        for entity in entities:
+            if entity.id not in self.entities:
+                self.entities[entity.id] = entity
+                # For entities, ensure attributes are strings/lists of strings
+                entity_attrs = {
+                    'name': entity.name,
+                    'type': entity.entity_type,
+                    'document_ids': json.dumps(entity.document_ids), # Convert list to JSON string
+                    'related_chunks': json.dumps(entity.related_chunks), # Convert list to JSON string
+                    'mentions': json.dumps(entity.mentions) # Convert list to JSON string
+                }
+                self.graph.add_node(entity.id, **entity_attrs)
+            else:
+                existing_entity = self.entities[entity.id]
+                # Update logic (ensure updates also handle None/type consistency if saving the whole graph again)
+                existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
+                existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
+                existing_entity.mentions.extend([m for m in entity.mentions if m not in existing_entity.mentions])
+
+                # Update graph node attributes explicitly for existing nodes
+                if entity.id in self.graph:
+                    self.graph.nodes[entity.id]['name'] = existing_entity.name
+                    self.graph.nodes[entity.id]['type'] = existing_entity.entity_type
+                    self.graph.nodes[entity.id]['document_ids'] = json.dumps(existing_entity.document_ids)
+                    self.graph.nodes[entity.id]['related_chunks'] = json.dumps(existing_entity.related_chunks)
+                    self.graph.nodes[entity.id]['mentions'] = json.dumps(existing_entity.mentions)
+
+        for entity in entities:
+            for chunk_id in entity.related_chunks:
+                if chunk_id in self.graph and entity.id in self.graph:
+                    # MENTIONS/MENTIONED_IN edges
+                    # These have simple string attributes, should be fine
+                    if self.graph.get_edge_data(chunk_id, entity.id, key='MENTIONS') is None:
+                        self.graph.add_edge(chunk_id, entity.id, key='MENTIONS', relation_type='MENTIONS', confidence=1.0)
+                    if self.graph.get_edge_data(entity.id, chunk_id, key='MENTIONED_IN') is None:
+                        self.graph.add_edge(entity.id, chunk_id, key='MENTIONED_IN', relation_type='MENTIONED_IN', confidence=1.0)
+                else:
+                    logger.debug(f"Skipping MENTIONS relation: Chunk {chunk_id} or Entity {entity.id} not found in graph for direct linking.")
+
+        # Add relations (between entities)
+        added_relation_tuples = set()
+
+        for relation in relations:
+            # Ensure both source and target nodes exist in the graph before adding edge
+            if relation.source_entity in self.graph and relation.target_entity in self.graph:
+                relation_tuple = (relation.source_entity, relation.target_entity, relation.relation_type)
+                if relation_tuple not in added_relation_tuples:
+                    if self.graph.get_edge_data(relation.source_entity, relation.target_entity, key=relation.id) is None:
+                        self.relations[relation.id] = relation
+                        # Ensure relation attributes are GML-compatible (strings, not None)
+                        edge_attrs = {
+                            'relation_type': relation.relation_type,
+                            'confidence': float(relation.confidence), # GML might prefer float over numpy types or specific precision
+                            'document_id': relation.document_id if relation.document_id is not None else "N/A", # Handle None
+                            'sentence': relation.sentence if relation.sentence is not None else "N/A" # Handle None
+                        }
+                        self.graph.add_edge(
+                            relation.source_entity,
+                            relation.target_entity,
+                            key=relation.id,
+                            **edge_attrs
+                        )
+                        added_relation_tuples.add(relation_tuple)
+            else:
+                logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph during relation addition.")
+
     def save_graph(self) -> bool:
         """Saves the NetworkX graph and associated entity/relation data."""
         try:
+            # KG_GRAPH_PATH is a Path object, so convert to string
             nx.write_gml(self.graph, str(KG_GRAPH_PATH))
 
             with open(KG_ENTITIES_PATH, 'w', encoding='utf-8') as f:
@@ -1224,6 +1356,7 @@ class KnowledgeGraphManager:
             # Save document chunks (metadata only, no embeddings)
             chunks_to_save = {cid: chunk.to_dict() for cid, chunk in self.document_chunks.items()}
             for cid in chunks_to_save:
+                # Ensure embedding is None or removed before JSON serialization
                 if 'embedding' in chunks_to_save[cid]:
                     chunks_to_save[cid]['embedding'] = None
             with open(KG_CHUNKS_PATH, 'w', encoding='utf-8') as f:
@@ -1776,188 +1909,3 @@ class StorageManager:
         logger.warning("Incomplete or failed load of data structures. Will re-process data.")
         return False
 
-
-# 10. MAIN RAG SYSTEM
-# =============================================================================
-
-class SimpleAdvancedRAGSystem:
-    def __init__(self):
-        self.embedding_service = EmbeddingService(
-            api_key=os.getenv("OPENAI_API_KEY"),
-            model_name=EMBEDDING_MODEL_NAME,
-            embedding_dim=EMBEDDING_DIM
-        )
-
-        self.storage_manager = StorageManager(DATA_PATH, STORAGE_PATH)
-        self.doc_processor = DocumentProcessor(self.embedding_service)
-        self.vector_index = VectorIndexManager(embedding_dim=EMBEDDING_DIM)
-        self.kg_manager = KnowledgeGraphManager()
-        self.retrieval_engine = HybridRetrievalEngine(self.vector_index, self.kg_manager, self.embedding_service)
-        self.response_generator = ResponseGenerator()
-
-        logger.info("RAG System components initialized.")
-
-    def initialize_knowledge_base(self):
-        """Initializes or re-processes the knowledge base based on data changes."""
-        # Attempt to load existing data
-        if self.storage_manager.load_all(self.vector_index, self.kg_manager):
-            # Data loaded, now check if original data files have changed
-            if not self.storage_manager.is_data_changed():
-                logger.info("Knowledge base is up-to-date. No re-processing needed.")
-                return
-
-        logger.info("Re-processing documents due to data changes or no prior data found.")
-        # Clear existing data structures before re-processing
-        self.vector_index._initialize_index()
-        self.vector_index.chunk_metadata = {}
-        self.vector_index.id_to_index = {}
-        self.vector_index.index_to_id = {}
-        self.vector_index.current_index = 0
-
-        self.kg_manager.graph = nx.MultiDiGraph()
-        self.kg_manager.entities = {}
-        self.kg_manager.relations = {}
-        self.kg_manager.document_chunks = {}
-
-        self._process_and_store_documents()
-        self.storage_manager.save_all(self.vector_index, self.kg_manager)
-        logger.info("Knowledge base re-processing complete and saved.")
-
-        # Always regenerate the knowledge gap report after (re)initialization
-        import knowledge_graph
-        try:
-            knowledge_graph.analyze_rag_knowledge_graph(self)
-            print("Knowledge gap report saved to knowledge_gap_report.md and printed above.")
-        except Exception as e:
-            logger.error(f"Error during knowledge graph visualization/analysis: {e}")
-
-    def _process_and_store_documents(self):
-        """Processes documents from the DATA_PATH and stores them."""
-        documents = self._load_documents_from_directory(DATA_PATH)
-
-        if not documents:
-            logger.warning(f"No documents found in {DATA_PATH}. Knowledge base will be empty.")
-            return
-
-        all_chunks = []
-        all_entities = []
-        all_relations = []
-
-        for doc in documents:
-            doc_id = doc['id']
-            content = doc['content']
-
-            # Process document
-            # MODIFIED: _process_document now returns modified 'entities' list
-            chunks, entities, relations = self.doc_processor.process_document(doc_id, content)
-
-            all_chunks.extend(chunks)
-            all_entities.extend(entities) # This list now contains any newly created study/dataset entities
-            all_relations.extend(relations)
-
-        self.vector_index.add_chunks(all_chunks)
-        self.kg_manager.add_data(all_chunks, all_entities, all_relations)
-
-        logger.info(f"Processed {len(documents)} documents, Created {len(all_chunks)} chunks, {len(all_entities)} Entities, {len(all_relations)} Relations.")
-
-    def _load_documents_from_directory(self, directory: Path) -> List[Dict[str, str]]:
-        """Load documents from a specified directory."""
-        documents = []
-        for file_path in directory.iterdir():
-            if file_path.is_file():
-                content = ""
-                if file_path.suffix.lower() == '.pdf':
-                    try:
-                        reader = pypdf.PdfReader(file_path)
-                        for page in reader.pages:
-                            # Extract text from each page and concatenate
-                            content += page.extract_text(0) + "\n"
-                        logger.info(f"Loaded PDF document: {file_path.name}")
-                    except Exception as e:
-                        logger.error(f"Could not read PDF {file_path} using pypdf: {e}")
-                        continue # Skip to next file if there's an error
-                elif file_path.suffix.lower() == '.txt':
-                    try:
-                        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read()
-                        logger.info(f"Loaded TXT document: {file_path.name}")
-                    except Exception as e:
-                        logger.error(f"Could not read TXT {file_path}: {e}")
-                        continue
-                else:
-                    logger.warning(f"Unsupported file type: {file_path.suffix} for {file_path.name}. Skipping.")
-                    continue
-
-                if content: # Only append if content was successfully extracted
-                    documents.append({'id': file_path.name, 'content': content})
-        return documents
-
-    def query(self, query_text: str, top_k: int = 5) -> Dict[str, Any]:
-        """Process a query and return results."""
-        logger.info(f"Processing query: '{query_text}'")
-        try:
-            # Retrieve relevant chunks
-            retrieved_chunks = self.retrieval_engine.retrieve(query_text, top_k)
-
-            # Analyze query for response generation (can reuse analysis from retrieval engine if desired)
-            query_analysis = self.retrieval_engine.query_processor.analyze_query(query_text)
-
-            # Generate response
-            response = self.response_generator.generate_response(
-                query_text, retrieved_chunks, query_analysis
-            )
-
-            # Add metadata
-            response['query_analysis'] = query_analysis
-            response['timestamp'] = datetime.now().isoformat()
-            response['status'] = 'success'
-
-            logger.info("Query processed successfully.")
-            return response
-
-        except Exception as e:
-            logger.exception(f"Error processing query: {e}")
-            return {
-                'status': 'error',
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-
-    def get_system_stats(self) -> Dict[str, Any]:
-        """Get system statistics."""
-        try:
-            return {
-                'status': 'success',
-                'vector_index_size': self.vector_index.index.ntotal if self.vector_index.index else 0,
-                'knowledge_graph_nodes': self.kg_manager.graph.number_of_nodes(),
-                'knowledge_graph_edges': self.kg_manager.graph.number_of_edges(),
-                'total_entities': len(self.kg_manager.entities),
-                'total_relations': len(self.kg_manager.relations),
-                'total_chunks_in_kg': len(self.kg_manager.document_chunks),
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Error getting system stats: {e}")
-            return {
-                'status': 'error',
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
-
-
-# 11. USAGE EXAMPLE
-# =============================================================================
-
-# Global variable to cache the RAG system instance
-_rag_system = None
-
-def answer_query(query: str) -> str:
-    global _rag_system
-    if _rag_system is None:
-        _rag_system = SimpleAdvancedRAGSystem()
-        _rag_system.initialize_knowledge_base()
-    result = _rag_system.query(query)
-    if result.get('status') == 'success':
-        return result.get('answer', 'No answer found.')
-    else:
-        return f"Error: {result.get('error', 'Unknown error')}"
