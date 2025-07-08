@@ -1057,6 +1057,10 @@ class VectorIndexManager:
 
         results = []
         for dist, idx in zip(distances[0], indices[0]):
+            # Add this check to filter out invalid indices (like -1)
+            if idx == -1:
+                continue
+
             if idx in self.index_to_id:
                 chunk_id = self.index_to_id[idx]
                 chunk_dict = self.chunk_metadata.get(chunk_id, {})
@@ -1072,9 +1076,9 @@ class VectorIndexManager:
                     }
                     results.append(result_item)
                 else:
-                    logger.warning(f"Index {idx} not found in chunk_metadata for chunk_id {chunk_id}. Data inconsistency.")
+                    logger.warning(f"Index {idx} found in index_to_id mapping but chunk_id {chunk_id} not in chunk_metadata. Data inconsistency.")
             else:
-                logger.warning(f"Index {idx} not found in index_to_id mapping. Data inconsistency.")
+                logger.error(f"FATAL: Valid FAISS index {idx} not found in index_to_id mapping. Possible corruption or desync.")
         return results
 
     def save_index(self):
