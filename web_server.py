@@ -20,14 +20,13 @@ import sys
 from main import (
     DocumentChunk, KnowledgeEntity, KnowledgeRelation, EmbeddingService,
     DocumentProcessor, VectorIndexManager, KnowledgeGraphManager,
-    QueryProcessor, HybridRetrievalEngine, ResponseGenerator, StorageManager,
+    QueryProcessor, HybridRetrievalEngine, ResponseGenerator,
     EMBEDDING_MODEL_NAME, EMBEDDING_DIM, LLM_MODEL_NAME, LLM_TEMPERATURE,
     LLM_MAX_TOKENS_CONTEXT, LLM_MAX_TOKENS_RESPONSE, TARGET_CHUNK_SIZE_TOKENS,
     CHUNK_OVERLAP_SENTENCES, MIN_CHUNK_SIZE_TOKENS, STORAGE_PATH, DATA_PATH,
     ENABLE_CACHE, CACHE_DIR, MAX_CONCURRENT_REQUESTS, REQUEST_TIMEOUT,
-    CACHE_VALIDITY_DAYS, SPACY_MODEL, LAST_DATA_HASH_PATH, KG_GRAPH_PATH,
-    KG_ENTITIES_PATH, KG_RELATIONS_PATH, KG_CHUNKS_PATH, FAISS_INDEX_PATH,
-    CHUNK_METADATA_PATH, ID_TO_INDEX_PATH, INDEX_TO_ID_PATH
+    CACHE_VALIDITY_DAYS, SPACY_MODEL, FAISS_INDEX_PATH, LAST_DATA_HASH_PATH,
+    CHUNK_METADATA_PATH, ID_TO_INDEX_PATH, INDEX_TO_ID_PATH, extract_document_level_metadata
 )
 # DOCUMENT_HASHES_PATH add later
 # Import networkx for graph manipulation (NEW ADDITION)
@@ -39,15 +38,96 @@ import knowledge_graph
 # Define GENERATE_KG_VISUALIZATION here as it's used in SimpleAdvancedRAGSystem
 GENERATE_KG_VISUALIZATION = os.getenv("GENERATE_KG_VISUALIZATION", "true").lower() == "true"
 
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 CORS(app)
 
-# MAIN RAG SYSTEM
-# =============================================================================
+class StorageManager:
+
+    def __init__(self, data_path: Path, storage_path: Path):
+        self.data_path = data_path
+        self.storage_path = storage_path
+        self.storage_path.mkdir(parents=True, exist_ok=True)
+
+    def _calculate_data_hash(self) -> str:
+        """Calculates a hash of all files in the data directory."""
+        hasher = hashlib.md5()
+        file_paths = sorted(list(self.data_path.rglob('*')))
+        for file_path in file_paths:
+            if file_path.is_file():
+                try:
+                    with open(file_path, 'rb') as f:
+                        for chunk in iter(lambda: f.read(4096), b''):
+                            hasher.update(chunk)
+                except Exception as e:
+                    logger.error(f"Error reading file {file_path} for hash calculation: {e}")
+                    continue
+        return hasher.hexdigest()
+
+    def _get_last_data_hash(self) -> Optional[str]:
+        """Reads the last stored data hash."""
+        if LAST_DATA_HASH_PATH.exists():
+            try:
+                return LAST_DATA_HASH_PATH.read_text().strip()
+            except Exception as e:
+                logger.error(f"Error reading last data hash from {LAST_DATA_HASH_PATH}: {e}")
+                return None
+        return None
+
+    def _save_data_hash(self, current_hash: str) -> bool:
+        """Saves the current data hash."""
+        try:
+            LAST_DATA_HASH_PATH.write_text(current_hash)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving data hash to {LAST_DATA_HASH_PATH}: {e}")
+            return False
+
+    def is_data_changed(self) -> bool:
+        """Checks if the data directory has changed since last processing."""
+        current_hash = self._calculate_data_hash()
+        last_hash = self._get_last_data_hash()
+
+        if current_hash != last_hash:
+            logger.info("Data directory has changed or no previous hash found. Re-processing required.")
+            return True
+        logger.info("Data directory is unchanged. Loading pre-calculated data.")
+        return False
+
+    def save_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager):
+        """Saves all relevant data structures. Only saves hash if all saves succeed."""
+        all_saves_successful = True
+
+        if not vector_index_manager.save_index():
+            all_saves_successful = False
+            logger.error("Failed to save FAISS index. Skipping data hash update.")
+
+        if not kg_manager.save_graph():
+            all_saves_successful = False
+            logger.error("Failed to save Knowledge Graph. Skipping data hash update.")
+
+        if all_saves_successful:
+            if self._save_data_hash(self._calculate_data_hash()):
+                logger.info("All data structures and data hash saved successfully.")
+            else:
+                logger.error("Failed to save data hash after successful index/graph saves. Data may be inconsistent on next load.")
+        else:
+            logger.error("Some data structures failed to save. Data hash not updated.")
+
+    def load_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager) -> bool:
+        """Loads all relevant data structures. Returns True if successful, False otherwise."""
+        vector_loaded = vector_index_manager.load_index()
+        kg_loaded = kg_manager.load_graph()
+
+        if vector_loaded and kg_loaded and LAST_DATA_HASH_PATH.exists():
+            # Only consider "loaded" if data hash exists, implies previous full save
+            logger.info("All data structures loaded successfully.")
+            return True
+
+        logger.warning("Incomplete or failed load of data structures. Will re-process data.")
+        return False
 class SimpleAdvancedRAGSystem:
     def __init__(self):
         # Ensure paths exist before initializing components that use them
@@ -66,7 +146,7 @@ class SimpleAdvancedRAGSystem:
         self.vector_index = VectorIndexManager(embedding_dim=EMBEDDING_DIM)
         self.kg_manager = KnowledgeGraphManager()
         self.retrieval_engine = HybridRetrievalEngine(self.vector_index, self.kg_manager, self.embedding_service)
-        self.response_generator = ResponseGenerator()
+        self.response_generator = ResponseGenerator(kg_manager=self.kg_manager)
 
         logger.info("RAG System components initialized successfully.")
 
@@ -91,6 +171,7 @@ class SimpleAdvancedRAGSystem:
         self.kg_manager.entities = {}
         self.kg_manager.relations = {}
         self.kg_manager.document_chunks = {}
+        self.kg_manager.all_document_metadata = {} # Reset document metadata on reprocessing
 
         # Perform the processing and saving
         self._process_and_store_documents()
@@ -130,6 +211,10 @@ class SimpleAdvancedRAGSystem:
             doc_id = doc['id']
             content = doc['content']
 
+            # Extract document-level metadata (like authors and title)
+            doc_metadata = extract_document_level_metadata(content, doc_id)
+            self.kg_manager.add_document_level_metadata(doc_id, doc_metadata)
+
             # Process document
             chunks, entities, relations = self.doc_processor.process_document(doc_id, content)
 
@@ -145,8 +230,7 @@ class SimpleAdvancedRAGSystem:
     def _load_documents_from_directory(self, directory: Path) -> List[Dict[str, str]]:
         """Load documents from a specified directory."""
         documents = []
-        # Import pypdf locally to avoid import errors if it's not strictly needed elsewhere
-        import pypdf
+        import pypdf # Import pypdf locally to avoid import errors if it's not strictly needed elsewhere
         for file_path in directory.iterdir():
             if file_path.is_file():
                 content = ""
@@ -199,24 +283,28 @@ class SimpleAdvancedRAGSystem:
 
     def get_system_stats(self) -> Dict[str, Any]:
         """Get system statistics."""
-        try:
-            return {
-                'status': 'success',
-                'vector_index_size': self.vector_index.index.ntotal if self.vector_index.index else 0,
-                'knowledge_graph_nodes': self.kg_manager.graph.number_of_nodes(),
-                'knowledge_graph_edges': self.kg_manager.graph.number_of_edges(),
-                'total_entities': len(self.kg_manager.entities),
-                'total_relations': len(self.kg_manager.relations),
-                'total_chunks_in_kg': len(self.kg_manager.document_chunks),
-                'timestamp': datetime.now().isoformat()
-            }
-        except Exception as e:
-            logger.error(f"Error getting system stats: {e}")
-            return {
-                'status': 'error',
-                'error': str(e),
-                'timestamp': datetime.now().isoformat()
-            }
+
+        kg_node_count = 0
+        kg_edge_count = 0
+        if self.kg_manager.driver:
+            try:
+                with self.kg_manager.driver.session() as session:
+                    count_result = session.run("MATCH (n) OPTIONAL MATCH (n)-[r]->(m) RETURN count(DISTINCT n) AS nodes, count(DISTINCT r) AS edges").single()
+                    kg_node_count = count_result['nodes']
+                    kg_edge_count = count_result['edges']
+            except Exception as e:
+                logger.warning(f"Could not fetch live Neo4j stats: {e}")
+
+        return {
+            'status': 'success',
+            'vector_index_size': self.vector_index.index.ntotal if self.vector_index.index else 0,
+            'knowledge_graph_nodes': kg_node_count, # Dynamically fetched
+            'knowledge_graph_edges': kg_edge_count, # Dynamically fetched
+            'total_entities': len(self.kg_manager.entities), # From in-memory cache
+            'total_relations': len(self.kg_manager.relations), # From in-memory cache (note: this is a transient list from processing, not live Neo4j count)
+            'total_chunks_in_kg': len(self.kg_manager.document_chunks), # From in-memory cache
+            'timestamp': datetime.now().isoformat()
+        }
 
 # Global instance of the RAG system
 rag_system_instance = None

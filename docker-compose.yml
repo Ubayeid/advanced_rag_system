@@ -1,4 +1,4 @@
-# version: '3.8' # The 'version' attribute is considered obsolete in newer Docker Compose versions, but it's fine to keep for compatibility. You can remove it if you wish.
+# version: .
 
 services:
   ciroh-rag:
@@ -10,10 +10,14 @@ services:
       - ./data:/app/data
       - ./storage:/app/storage
       - ./cache:/app/cache
-    mem_limit: 8g
     environment:
+      # OpenAI API Key - IMPORTANT: This should be set in your host's .env file.
       - OPENAI_API_KEY=${OPENAI_API_KEY}
-      # Embedding model configuration with default values if not set in host environment
+      # Neo4j Connection Details - IMPORTANT: Set these in your host's .env file.
+      - NEO4J_URI=${NEO4J_URI:-bolt://neo4j:7687}
+      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-12345678} # Change this strong password!
+      # Embedding model configuration with default values
       - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-all-MiniLM-L6-v2}
       - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
       # LLM configuration with default values
@@ -34,16 +38,38 @@ services:
       - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-10}
       - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-60}
       - CACHE_VALIDITY_DAYS=${CACHE_VALIDITY_DAYS:-1}
-      # SpaCy model to be used by the application
       - SPACY_MODEL=${SPACY_MODEL:-en_core_web_sm}
-      # NEW: Control knowledge graph visualization generation
       - GENERATE_KG_VISUALIZATION=${GENERATE_KG_VISUALIZATION:-true}
+    depends_on:
+      neo4j:
+        condition: service_healthy
     restart: unless-stopped
     stdin_open: true
     tty: true
     command: gunicorn --bind 0.0.0.0:8000 --workers 1 --timeout 300 web_server:app
 
+  neo4j:
+    image: neo4j:5.20.0-community
+    container_name: neo4j_db
+    ports:
+      - "7474:7474" # Browser UI
+      - "7687:7687" # Bolt port
+    volumes:
+      - ./neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password} # User/Pass for Neo4j
+      - NEO4J_server_memory_heap_max__size=1G
+      - NEO4J_server_memory_pagecache_size=512M
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   data:
   storage:
   cache:
+  neo4j_data:

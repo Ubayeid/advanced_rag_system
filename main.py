@@ -1,3 +1,4 @@
+# main.py
 import pypdf
 import asyncio
 import json
@@ -19,7 +20,9 @@ import tiktoken
 
 # Core libraries
 import faiss
-import networkx as nx
+# Networkx is now only imported in knowledge_graph.py for visualization purposes.
+# If any function in main.py directly used networkx, you would need to uncomment this.
+# import networkx as nx
 from sklearn.feature_extraction.text import TfidfVectorizer
 import spacy
 from spacy.matcher import Matcher, PhraseMatcher
@@ -28,18 +31,15 @@ from spacy.matcher import Matcher, PhraseMatcher
 from openai import OpenAI, APIError
 from sentence_transformers import SentenceTransformer
 
-import knowledge_graph
-
-# Plotly specific import for renderer control
-import plotly.io as pio
+# Neo4j specific import
+from neo4j import GraphDatabase, basic_auth, exceptions as neo4j_exceptions # NEW
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Load environment variables
-load_dotenv()
-
+load_dotenv() # Load environment variables early
 
 # Configuration Constants (Loaded from .env or default values)
 # =============================================================================
@@ -68,12 +68,9 @@ FAISS_INDEX_PATH = STORAGE_PATH / "faiss_index.bin"
 CHUNK_METADATA_PATH = STORAGE_PATH / "chunk_metadata.json"
 ID_TO_INDEX_PATH = STORAGE_PATH / "id_to_index.json"
 INDEX_TO_ID_PATH = STORAGE_PATH / "index_to_id.json"
-KG_GRAPH_PATH = STORAGE_PATH / "kg_graph.gml"
-KG_ENTITIES_PATH = STORAGE_PATH / "kg_entities.json"
-KG_RELATIONS_PATH = STORAGE_PATH / "kg_relations.json"
-LAST_DATA_HASH_PATH = STORAGE_PATH / "data_hash.txt"
-KG_CHUNKS_PATH = STORAGE_PATH / "kg_chunks.json"
-# DOCUMENT_HASHES_PATH = STORAGE_PATH / "document_hashes.json"
+LAST_DATA_HASH_PATH = STORAGE_PATH / "last_data_hash.json"
+KG_DOC_METADATA_PATH = STORAGE_PATH / "kg_document_metadata.json"
+
 # System Settings
 ENABLE_CACHE = os.getenv("ENABLE_CACHE", "true").lower() == "true"
 CACHE_DIR = Path(os.getenv("CACHE_DIR", "./cache"))
@@ -84,14 +81,17 @@ CACHE_VALIDITY_DAYS = int(os.getenv("CACHE_VALIDITY_DAYS", "1"))
 # SpaCy Model Configuration
 SPACY_MODEL = os.getenv("SPACY_MODEL", "en_core_web_sm")
 
+# Neo4j Configuration (loaded from .env)
+NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+
+
 # Ensure storage and data directory exist
 STORAGE_PATH.mkdir(parents=True, exist_ok=True)
 DATA_PATH.mkdir(parents=True, exist_ok=True)
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# 1. DATA STRUCTURES
-# =============================================================================
 
 @dataclass
 class DocumentChunk:
@@ -144,8 +144,8 @@ class KnowledgeEntity:
     name: str
     entity_type: str
     confidence: float
-    document_ids: List[str] = field(default_factory=list)
-    related_chunks: List[str] = field(default_factory=list)
+    document_ids: List[str] = field(default_factory=list) # These will be derived from relationships in Neo4j
+    related_chunks: List[str] = field(default_factory=list) # These will be derived from relationships in Neo4j
     mentions: List[str] = field(default_factory=list)
 
     def to_dict(self):
@@ -158,8 +158,8 @@ class KnowledgeEntity:
 @dataclass
 class KnowledgeRelation:
     id: str
-    source_entity: str
-    target_entity: str
+    source_entity: str # ID of source entity
+    target_entity: str # ID of target entity
     relation_type: str
     confidence: float
     document_id: Optional[str] = None
@@ -172,9 +172,6 @@ class KnowledgeRelation:
     def from_dict(data: Dict[str, Any]):
         return KnowledgeRelation(**data)
 
-
-# 2. UTILITY SERVICES (Embedding, etc.)
-# =============================================================================
 
 class EmbeddingService:
     def __init__(self, api_key: Optional[str] = None, model_name: str = "all-MiniLM-L6-v2", embedding_dim: int = 384):
@@ -251,8 +248,56 @@ class EmbeddingService:
             return np.zeros(self.embedding_dim, dtype=np.float32)
 
 
-# 3. DOCUMENT PROCESSOR
-# =============================================================================
+def extract_document_level_metadata(full_doc_text: str, document_id: str) -> Dict[str, Any]:
+    metadata = {}
+    
+    # Improved regex for author block, still a heuristic
+    author_match = re.search(r'(?:Authors?|Author Information|Contributors?)\s*(?::|\n)\s*([\s\S]+?)(?=\n\n|\n[A-Z][a-z]+|\n\d+\.\s)', full_doc_text, re.IGNORECASE)
+    if author_match:
+        author_block = author_match.group(1).strip()
+        # Further parse the author_block to get individual names, cleaning affiliations/numbers
+        # Split by common separators: comma, semicolon, 'and', newline
+        raw_authors = re.split(r'(?:,)\s*|\s*(?:;)\s*|\s+and\s+|\n', author_block)
+        authors = []
+        for name in raw_authors:
+            name = name.strip()
+            if not name:
+                continue
+            # Remove numerical references (e.g., [1], 1), email addresses, affiliations in parentheses
+            name = re.sub(r'\[\d+\]|\s*\d+\s*|\s*\(.*?\)\s*|\s*<.*?>\s*', '', name)
+            # Remove common affiliation indicators if they survived
+            name = re.sub(r'^\*|\s*\(affil\.\d+\)$', '', name).strip()
+            
+            # Basic check to ensure it looks like a name (at least two words or a capitalized initial followed by a capitalized word)
+            if len(name.split()) >= 2 or re.match(r'^[A-Z]\.\s*[A-Z][a-z]+', name):
+                authors.append(name)
+        
+        metadata['authors'] = list(set(authors)) # Deduplicate
+        logger.info(f"Extracted authors for {document_id}: {metadata['authors']}")
+    else:
+        logger.warning(f"Could not find a clear author block for {document_id}")
+
+    # More robust title extraction
+    title = f"Document {document_id.replace('.pdf', '')}" # Default to filename
+    # Try to find a prominent title at the beginning of the document
+    potential_titles = re.findall(r'^.{10,200}\n\n', full_doc_text, re.MULTILINE)
+    if potential_titles:
+        # Take the first one that doesn't look like a header or very short text
+        for pt in potential_titles:
+            pt_clean = pt.strip()
+            if 20 < len(pt_clean) < 200 and not pt_clean.isupper() and not re.match(r'^\d+\.', pt_clean) and not re.match(r'^(?:CHAPTER|SECTION)\s+\d+', pt_clean, re.IGNORECASE):
+                title = pt_clean
+                break
+    else:
+        # Fallback for complex titles or if initial lines are not titles
+        title_search = re.search(r'(?:Title|Paper Title|Article Title)[:\s]*(.+?)\n', full_doc_text, re.IGNORECASE)
+        if title_search:
+            title = title_search.group(1).strip()
+        
+    metadata['title'] = title
+    logger.info(f"Extracted title for {document_id}: {metadata['title']}")
+
+    return metadata
 
 class DocumentProcessor:
     def __init__(self, embedding_service: EmbeddingService):
@@ -356,8 +401,7 @@ class DocumentProcessor:
             ]])
 
             self.matcher.add("ENSURES_INDEPENDENCE", [
-                [{"LOWER": "minimum"}, {"LOWER": "separation"}, {"LOWER": "time"},
-                 {"TEXT": "(", "OP": "?"}, {"TEXT": "MST", "OP": "?"}, {"TEXT": ")", "OP": "?"}],
+                [{"LOWER": "minimum"}, {"LOWER": "separation"}, {"LOWER": "time"}, {"TEXT": "(", "OP": "?"}, {"TEXT": "MST", "OP": "?"}, {"TEXT": ")", "OP": "?"}],
                 [{"LOWER": "declustering"}, {"LOWER": "scheme"}, {"LEMMA": "utilize"}]
             ])
 
@@ -399,7 +443,7 @@ class DocumentProcessor:
         # Extract entities first
         entities = self._extract_entities(cleaned_content, document_id)
 
-        # MODIFIED: Use the new chunking method that infers metadata
+        # Infer metadata
         chunks = self._create_chunks_with_metadata_inference(cleaned_content, document_id)
 
         # Generate embeddings for each chunk
@@ -510,9 +554,9 @@ class DocumentProcessor:
         return all_final_chunks
 
     def _process_single_content_segment(self, doc_id: str, segment_content: str,
-                                        section_title: str, subsection_title: Optional[str], page_number: Optional[int],
-                                        max_tokens: int, fallback_char_size: int,
-                                        start_chunk_index: int) -> List[DocumentChunk]:
+                                         section_title: str, subsection_title: Optional[str], page_number: Optional[int],
+                                         max_tokens: int, fallback_char_size: int,
+                                         start_chunk_index: int) -> List[DocumentChunk]:
         """
         Helper method to process a single continuous content segment (e.g., a page or a pre-page block)
         into overlapping chunks, maintaining a consistent metadata context.
@@ -971,8 +1015,6 @@ class DocumentProcessor:
                                 extracted_relations_set.add((relation.source_entity, relation.target_entity, relation.relation_type))
         return relations, entities
 
-# 4. VECTOR INDEX MANAGER
-# =============================================================================
 
 class VectorIndexManager:
     def __init__(self, embedding_dim: int = EMBEDDING_DIM):
@@ -1121,283 +1163,436 @@ class VectorIndexManager:
         logger.info("No existing FAISS index found. Starting fresh.")
         return False
 
-# 5. KNOWLEDGE GRAPH MANAGER
-# =============================================================================
 
 class KnowledgeGraphManager:
     def __init__(self):
-        self.graph = nx.MultiDiGraph()
-        self.entities: Dict[str, KnowledgeEntity] = {}
-        self.relations: Dict[str, KnowledgeRelation] = {}
-        self.document_chunks: Dict[str, DocumentChunk] = {}
+        # Neo4j Driver setup
+        self.driver = None
+        try:
+            self.driver = GraphDatabase.driver(NEO4J_URI, auth=basic_auth(NEO4J_USERNAME, NEO4J_PASSWORD))
+            self.driver.verify_connectivity()
+            logger.info("Connected to Neo4j database.")
+            self._initialize_neo4j_constraints_and_indexes()
+        except neo4j_exceptions.ServiceUnavailable as e:
+            logger.error(f"Neo4j service unavailable. Is the database running? Error: {e}")
+            self.driver = None # Indicate failure
+        except neo4j_exceptions.AuthError as e:
+            logger.error(f"Neo4j authentication failed. Check NEO4J_USERNAME and NEO4J_PASSWORD. Error: {e}")
+            self.driver = None
+        except Exception as e:
+            logger.error(f"Failed to connect to Neo4j: {e}")
+            self.driver = None
+
+        self.entities: Dict[str, KnowledgeEntity] = {} # Still keep an in-memory cache of entities for quick lookups
+        self.relations: List[KnowledgeRelation] = [] # Relations are primarily in Neo4j, but processing creates this list transiently
+        self.document_chunks: Dict[str, DocumentChunk] = {} # Chunks are still managed by VectorIndexManager, not Neo4j directly
+        self.all_document_metadata: Dict[str, Dict[str, Any]] = {} # This will be loaded from/saved to local file, but its content will be synced to Neo4j.
+
+    def _initialize_neo4j_constraints_and_indexes(self):
+        if not self.driver:
+            logger.warning("No Neo4j driver available, skipping constraint and index creation.")
+            return
+
+        with self.driver.session() as session:
+            try:
+                # Constraints for uniqueness and faster lookups
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (a:Author) REQUIRE a.name IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE")
+                
+                # Indexes for faster property lookups
+                session.run("CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.original_entity_type)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (e:WATER_BODY) ON (e.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (e:PERSON) ON (e.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (r:Relation) ON (r.type)")
+                
+                logger.info("Neo4j constraints and indexes ensured.")
+            except Exception as e:
+                logger.error(f"Failed to create Neo4j constraints/indexes: {e}")
+
+    def add_document_level_metadata(self, doc_id: str, metadata: Dict[str, Any]):
+        self.all_document_metadata[doc_id] = metadata
+        if not self.driver:
+            logger.warning("No Neo4j connection, skipping adding document metadata to Neo4j.")
+            return
+
+        with self.driver.session() as session:
+            try:
+                # Create or update Document node
+                session.run("""
+                    MERGE (d:Document {id: $doc_id})
+                    SET d.title = $title,
+                        d.filepath = $filepath
+                    """,
+                    doc_id=doc_id,
+                    title=metadata.get('title', doc_id.replace('.pdf', '')),
+                    filepath=doc_id # Or the full path if stored in metadata
+                )
+                logger.debug(f"MERGED Document {doc_id} into Neo4j.")
+
+                # Create or update Author nodes and link them to the Document
+                if 'authors' in metadata and metadata['authors']:
+                    for author_name in metadata['authors']:
+                        session.run("""
+                            MERGE (a:Author {name: $author_name})
+                            MERGE (d:Document {id: $doc_id})
+                            MERGE (a)-[:AUTHORED]->(d)
+                            """,
+                            author_name=author_name,
+                            doc_id=doc_id
+                        )
+                    logger.debug(f"MERGED Authors for Document {doc_id} into Neo4j.")
+            except Exception as e:
+                logger.error(f"Failed to add document-level metadata for {doc_id} to Neo4j: {e}")
+
+    def get_all_document_metadata(self) -> Dict[str, Dict[str, Any]]:
+        # This method is primarily for retrieval of _all_ metadata (e.g. for global_authors)
+        # It's still sourced from the local JSON for efficiency during initial load,
+        # but the data *comes from* Neo4j on full rebuild, then saved to local file.
+        return self.all_document_metadata
 
     def add_data(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity], relations: List[KnowledgeRelation]):
-        """Add entities, relations, and chunks to the graph."""
+        """Add entities, relations, and chunks to the Neo4j graph."""
+        if not self.driver:
+            logger.warning("No Neo4j connection, skipping adding chunks, entities, relations to Neo4j.")
+            return
 
+        for entity in entities:
+            self.entities[entity.id] = entity # Keep in-memory cache for fast entity lookup
         for chunk in chunks:
-            if chunk.id not in self.document_chunks:
-                self.document_chunks[chunk.id] = chunk
+            self.document_chunks[chunk.id] = chunk # Keep in-memory cache for fast chunk lookup
 
-            self.graph.add_node(chunk.id, type='CHUNK', content=chunk.content[:200] + '...', document_id=chunk.document_id, chunk_index=chunk.chunk_index,
-                                section_title=chunk.section_title, subsection_title=chunk.subsection_title, page_number=chunk.page_number)
+        with self.driver.session() as session:
+            try:
+                # Add Chunks and link to Documents
+                for chunk in chunks:
+                    session.run("""
+                        MERGE (c:Chunk {id: $chunk_id})
+                        SET c.content = $content,
+                            c.chunk_index = $chunk_index,
+                            c.section_title = $section_title,
+                            c.subsection_title = $subsection_title,
+                            c.page_number = $page_number
+                        MERGE (d:Document {id: $doc_id})
+                        MERGE (c)-[:FROM_DOCUMENT]->(d)
+                        """,
+                        chunk_id=chunk.id,
+                        content=chunk.content,
+                        chunk_index=chunk.chunk_index,
+                        section_title=chunk.section_title,
+                        subsection_title=chunk.subsection_title,
+                        page_number=chunk.page_number,
+                        doc_id=chunk.document_id
+                    )
+                logger.info(f"Added {len(chunks)} chunks to Neo4j.")
 
-        for entity in entities:
-            if entity.id not in self.entities:
-                self.entities[entity.id] = entity
-                self.graph.add_node(entity.id, name=entity.name, type=entity.entity_type, document_ids=entity.document_ids, related_chunks=entity.related_chunks, mentions=entity.mentions)
-            else:
-                existing_entity = self.entities[entity.id]
-                existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
-                existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
-                existing_entity.mentions.extend([m for m in entity.mentions if m not in existing_entity.mentions])
-                self.graph.nodes[entity.id]['name'] = existing_entity.name
-                self.graph.nodes[entity.id]['type'] = existing_entity.entity_type
-                self.graph.nodes[entity.id]['document_ids'] = existing_entity.document_ids
-                self.graph.nodes[entity.id]['related_chunks'] = existing_entity.related_chunks
-                self.graph.nodes[entity.id]['mentions'] = existing_entity.mentions
+                # Add Entities and link to Chunks
+                for entity in entities:
+                    # Ensure entity_type is valid for a Neo4j label (no spaces, special chars, etc.)
+                    # You've defined your types like 'PERSON', 'WATER_BODY', etc., which are good.
+                    # If any come from spaCy NER labels (like 'LOC', 'ORG'), ensure they are also valid.
+                    entity_label_suffix = entity.entity_type.replace(" ", "_").replace("-", "_").upper()
+                    
+                    session.run(f"""
+                        MERGE (e:Entity:`{entity_label_suffix}` {{id: $entity_id}})
+                        SET e.name = $entity_name,
+                            e.confidence = $confidence,
+                            e.mentions = $mentions_json, // Store mentions as JSON string
+                            e.original_entity_type = $entity_type // Store original string type as a property if needed
+                        WITH e
+                        UNWIND $document_ids AS doc_id
+                        MERGE (d:Document {{id: doc_id}})
+                        MERGE (e)-[:MENTIONED_IN]->(d)
+                        WITH e, d
+                        UNWIND $related_chunks AS chunk_id
+                        MERGE (c:Chunk {{id: chunk_id}})
+                        MERGE (e)-[:MENTIONED_IN_CHUNK]->(c)
+                        """,
+                        entity_id=entity.id,
+                        entity_name=entity.name,
+                        entity_type=entity.entity_type, # Now used for `original_entity_type` property
+                        confidence=entity.confidence,
+                        document_ids=entity.document_ids,
+                        mentions_json=json.dumps(entity.mentions)
+                    )
+                logger.info(f"Added {len(entities)} entities to Neo4j.")
 
-        for entity in entities:
-            for chunk_id in entity.related_chunks:
-                if chunk_id in self.graph and entity.id in self.graph:
-                    if self.graph.get_edge_data(chunk_id, entity.id, key='MENTIONS') is None:
-                        self.graph.add_edge(chunk_id, entity.id, key='MENTIONS', relation_type='MENTIONS', confidence=1.0)
-                    if self.graph.get_edge_data(entity.id, chunk_id, key='MENTIONED_IN') is None:
-                        self.graph.add_edge(entity.id, chunk_id, key='MENTIONED_IN', relation_type='MENTIONED_IN', confidence=1.0)
-                else:
-                    logger.debug(f"Skipping MENTIONS relation: Chunk {chunk_id} or Entity {entity.id} not found in graph for direct linking.")
-
-        # Add relations (between entities)
-        added_relation_tuples = set()
-
-        for relation in relations:
-            # Ensure both source and target nodes exist in the graph before adding edge
-            if relation.source_entity in self.graph and relation.target_entity in self.graph:
-                relation_tuple = (relation.source_entity, relation.target_entity, relation.relation_type)
-                if relation_tuple not in added_relation_tuples:
-                    if self.graph.get_edge_data(relation.source_entity, relation.target_entity, key=relation.id) is None:
-                        self.relations[relation.id] = relation
-                        self.graph.add_edge(
-                            relation.source_entity,
-                            relation.target_entity,
-                            key=relation.id,
-                            relation_type=relation.relation_type,
+                # Add Relations between Entities
+                for relation in relations:
+                    if relation.relation_type == 'CO_OCCURS':
+                        session.run(f"""
+                            MATCH (s:Entity {{id: $source_entity_id}}), (t:Entity {{id: $target_entity_id}})
+                            CREATE (s)-[r:{relation.relation_type} {{
+                                id: $relation_id,
+                                confidence: $confidence,
+                                document_id: $document_id,
+                                sentence: $sentence
+                            }}]->(t)
+                            """,
+                            source_entity_id=relation.source_entity,
+                            target_entity_id=relation.target_entity,
+                            relation_id=relation.id,
                             confidence=relation.confidence,
                             document_id=relation.document_id,
                             sentence=relation.sentence
                         )
-                        added_relation_tuples.add(relation_tuple)
-                else:
-                    logger.debug(f"Skipping semantically duplicate relation type '{relation.relation_type}' between {relation.source_entity} and {relation.target_entity}.")
-            else:
-                logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph during relation addition.")
+                    else: # For specific, unique semantic relations
+                        session.run(f"""
+                            MATCH (s:Entity {{id: $source_entity_id}}), (t:Entity {{id: $target_entity_id}})
+                            MERGE (s)-[r:{relation.relation_type}]->(t)
+                            ON CREATE SET
+                                r.id = $relation_id,
+                                r.confidence = $confidence,
+                                r.document_id = $document_id,
+                                r.sentence = $sentence
+                            ON MATCH SET
+                                r.confidence = ($confidence + r.confidence) / 2.0 # Update confidence on merge
+                            """,
+                            source_entity_id=relation.source_entity,
+                            target_entity_id=relation.target_entity,
+                            relation_id=relation.id,
+                            confidence=relation.confidence,
+                            document_id=relation.document_id,
+                            sentence=relation.sentence
+                        )
+                logger.info(f"Added {len(relations)} relations to Neo4j.")
 
-        logger.info(f"KG Population Status: Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}.")
-        logger.info(f"Total entities stored: {len(self.entities)}, Total relations stored: {len(self.relations)}, Total document chunks stored: {len(self.document_chunks)}")
+            except Exception as e:
+                logger.error(f"Failed to add data to Neo4j: {e}")
 
     def get_related_info(self, query_entities: List[str], max_distance: int = 2) -> List[Dict[str, Any]]:
-        """ Get entities and related chunks connected to the given query entities, traversing the knowledge graph. """
+        """ Get entities and related chunks connected to the given query entities, traversing the Neo4j graph. """
         related_info = []
-        seen_nodes = set()
-
-        query_entity_ids = []
-        for q_ent_name in query_entities:
-            for eid, entity_obj in self.entities.items():
-                if entity_obj.name.lower() == q_ent_name.lower() or q_ent_name.lower() in [m.lower() for m in entity_obj.mentions]:
-                    query_entity_ids.append(eid)
-                    break
-        if not query_entity_ids:
+        if not self.driver:
+            logger.warning("No Neo4j connection, cannot retrieve related info.")
             return []
 
-        for start_node_id in query_entity_ids:
-            if start_node_id not in self.graph:
-                continue
+        # Convert query entities to lowercase for case-insensitive matching
+        query_entity_names_lower = [name.lower() for name in query_entities]
+        
+        # Cypher query to find entities and their connected chunks/documents within max_distance
+        # This is a complex query to get both entity and chunk details for all paths
+        cypher_query_refined = """
+        UNWIND $query_entity_names AS q_name_lower
+        MATCH (query_entity:Entity)
+        WHERE toLower(query_entity.name) = q_name_lower OR toLower(query_entity.mentions) CONTAINS toLower(q_name_lower)
+        
+        WITH query_entity
+        MATCH path = (query_entity)-[r*1..$max_distance]-(target_node)
+        WHERE (target_node:Entity OR target_node:Chunk OR target_node:Document OR target_node:Author) # Added Author here
+        AND NOT (target_node:Chunk AND query_entity:Entity AND EXISTS((query_entity)-[:MENTIONED_IN_CHUNK]->(target_node))) # Avoid direct mentions if just asking for related
+        AND NOT (target_node:Document AND query_entity:Entity AND EXISTS((query_entity)-[:MENTIONED_IN]->(target_node))) # Avoid direct mentions if just asking for related
+        
+        WITH DISTINCT target_node, query_entity
+        OPTIONAL MATCH (target_node)-[rel_out]->(neighbor_out)
+        WHERE NOT type(rel_out) IN ['FROM_DOCUMENT', 'MENTIONED_IN_CHUNK'] # AUTHORED is okay here, it connects Authors to Docs
+        OPTIONAL MATCH (neighbor_in)-[rel_in]->(target_node)
+        WHERE NOT type(rel_in) IN ['FROM_DOCUMENT', 'MENTIONED_IN_CHUNK'] # AUTHORED is okay here
+        
+        RETURN 
+            id(target_node) AS id, 
+            labels(target_node)[0] AS type, 
+            target_node.name AS name, 
+            target_node.content AS content_snippet,
+            target_node.document_id AS document_id,
+            target_node.page_number AS page_number,
+            target_node.section_title AS section_title,
+            target_node.subsection_title AS subsection_title,
+            target_node.title AS document_title, # Added for document nodes
+            target_node.authors AS document_authors, # Added for document nodes
+            COLLECT(DISTINCT {
+                type: type(rel_out),
+                target_name: neighbor_out.name,
+                target_id: id(neighbor_out)
+            }) AS relations_out,
+            COLLECT(DISTINCT {
+                type: type(rel_in),
+                source_name: neighbor_in.name,
+                source_id: id(neighbor_in)
+            }) AS relations_in,
+            min(length(shortestPath((query_entity)-[*]->(target_node)))) AS distance_from_query_entity
+        ORDER BY distance_from_query_entity ASC
+        LIMIT 100
+        """ # Limiting results to avoid overwhelming output
 
-            # BFS to find nodes within max_distance
-            for target_node in nx.bfs_tree(self.graph, start_node_id, depth_limit=max_distance).nodes():
-                if target_node == start_node_id:
-                    continue
+        records = []
+        try:
+            with self.driver.session() as session:
+                records, summary, keys = session.run(
+                    cypher_query_refined, 
+                    query_entity_names=query_entity_names_lower, 
+                    max_distance=max_distance
+                )
+            for record in records:
+                item = record.data()
+                # Neo4j ID is an int, but our dataclasses expect string. Convert.
+                item['id'] = str(item['id'])
+                
+                # Adjust 'name' and 'content_snippet' based on node type for consistency
+                if item['type'] == 'Chunk':
+                    item['name'] = None # Chunks don't have a 'name' property
+                elif item['type'] == 'Document':
+                    item['name'] = item.get('document_title', item['id'])
+                    item['content_snippet'] = item['name'] # Set content snippet to title for documents
+                elif item['type'] == 'Author':
+                    item['name'] = item.get('name', item['id']) # Use Author's name
+                    item['content_snippet'] = f"Author: {item['name']}"
 
-                if target_node not in seen_nodes:
-                    node_data = self.graph.nodes[target_node]
-                    try:
-                        distance = nx.shortest_path_length(self.graph, source=start_node_id, target=target_node)
-                    except nx.NetworkXNoPath:
-                        continue
+                # Filter out redundant relations (e.g., MENTIONED_IN_CHUNK which are handled by main entity-chunk link)
+                # Re-evaluate filter for AUTHORS, as AUTHORED is a meaningful relation here.
+                filtered_relations_out = [r for r in item['relations_out'] if r['type'] not in ['FROM_DOCUMENT', 'MENTIONED_IN_CHUNK']]
+                filtered_relations_in = [r for r in item['relations_in'] if r['type'] not in ['FROM_DOCUMENT', 'MENTIONED_IN_CHUNK']]
+                item['relations_out'] = filtered_relations_out
+                item['relations_in'] = filtered_relations_in
+                
+                # The 'type' and 'name' properties from the Cypher query should be sufficient.
+                # 'entity_type' is typically for :Entity nodes.
+                # Standardize to a single 'type' key.
+                # item['type'] = item['type'] if item['type'] != 'Entity' else item['name'] # Removed this, keeping Neo4j label as primary type
 
-                    info_item = {
-                        'id': target_node,
-                        'type': node_data.get('type'),
-                        'distance_from_query_entity': distance
-                    }
+                related_info.append(item)
 
-                    if node_data.get('type') == 'CHUNK':
-                        chunk_obj = self.document_chunks.get(target_node)
-                        if chunk_obj:
-                            info_item['content_snippet'] = chunk_obj.content[:200] + "..."
-                            info_item['document_id'] = chunk_obj.document_id
-                            info_item['page_number'] = chunk_obj.page_number
-                            info_item['section_title'] = chunk_obj.section_title
-                        else:
-                            info_item['content_snippet'] = node_data.get('content', '')
-                            info_item['document_id'] = "UNKNOWN"
-                    elif node_data.get('type') in ['PERSON', 'ORG', 'GPE', 'NORP', 'FAC', 'LOCATION', 'PRODUCT', 'EVENT', 'WORK_OF_ART', 'LAW', 'LANGUAGE', 'DATE', 'TIME', 'PERCENT', 'MONEY', 'QUANTITY', 'ORDINAL', 'CARDINAL', 'STUDY', 'WATER_BODY', 'HYDRO_MEASUREMENT', 'POLLUTANT', 'HYDRO_EVENT', 'HYDRO_INFRASTRUCTURE', 'HYDRO_MODEL', 'DATASET']: # Added DATASET
-                        info_item['name'] = node_data.get('name')
-                        if self.graph.has_edge(start_node_id, target_node):
-                            connecting_edge_data = self.graph.get_edge_data(start_node_id, target_node)
-                            if connecting_edge_data:
-                                found_edge_attrs = None
-                                for key in connecting_edge_data:
-                                    edge_attrs = connecting_edge_data[key]
-                                    if edge_attrs.get('relation_type') not in ['MENTIONS', 'MENTIONED_IN']:
-                                        found_edge_attrs = edge_attrs
-                                        break
-                                if not found_edge_attrs and connecting_edge_data:
-                                    found_edge_attrs = list(connecting_edge_data.values())[0]
+        except neo4j_exceptions.ClientError as e:
+            logger.error(f"Neo4j Cypher query failed (ClientError): {e}")
+            logger.error(f"Query: {cypher_query_refined}")
+            logger.error(f"Params: {query_entity_names_lower}, {max_distance}")
+            related_info.append({'error': f"Neo4j query error: {e.code} - {e.message}"})
+        except Exception as e:
+            logger.error(f"Unexpected error during Neo4j retrieval: {e}")
+            related_info.append({'error': f"Unexpected retrieval error: {str(e)}"})
 
-                                if found_edge_attrs:
-                                    info_item['connection_type'] = found_edge_attrs.get('relation_type', 'unknown')
-                                    info_item['connection_confidence'] = found_edge_attrs.get('confidence', 0.0)
-                    related_info.append(info_item)
-                    seen_nodes.add(target_node)
         return related_info
 
-    def add_data(self, chunks: List[DocumentChunk], entities: List[KnowledgeEntity], relations: List[KnowledgeRelation]):
-        """Add entities, relations, and chunks to the graph."""
-
-        for chunk in chunks:
-            if chunk.id not in self.document_chunks:
-                self.document_chunks[chunk.id] = chunk
-
-            # Ensure attributes are GML-compatible (strings, not None)
-            chunk_attrs = {
-                'type': 'CHUNK',
-                'content': chunk.content[:200] + '...',
-                'document_id': chunk.document_id,
-                'chunk_index': str(chunk.chunk_index), # Convert int to string for GML
-                'section_title': chunk.section_title if chunk.section_title is not None else "N/A", # Handle None
-                'subsection_title': chunk.subsection_title if chunk.subsection_title is not None else "N/A", # Handle None
-                'page_number': str(chunk.page_number) if chunk.page_number is not None else "N/A" # Convert int to string, handle None
-            }
-            self.graph.add_node(chunk.id, **chunk_attrs)
-
-        for entity in entities:
-            if entity.id not in self.entities:
-                self.entities[entity.id] = entity
-                # For entities, ensure attributes are strings/lists of strings
-                entity_attrs = {
-                    'name': entity.name,
-                    'type': entity.entity_type,
-                    'document_ids': json.dumps(entity.document_ids), # Convert list to JSON string
-                    'related_chunks': json.dumps(entity.related_chunks), # Convert list to JSON string
-                    'mentions': json.dumps(entity.mentions) # Convert list to JSON string
-                }
-                self.graph.add_node(entity.id, **entity_attrs)
-            else:
-                existing_entity = self.entities[entity.id]
-                # Update logic (ensure updates also handle None/type consistency if saving the whole graph again)
-                existing_entity.document_ids.extend([d_id for d_id in entity.document_ids if d_id not in existing_entity.document_ids])
-                existing_entity.related_chunks.extend([c_id for c_id in entity.related_chunks if c_id not in existing_entity.related_chunks])
-                existing_entity.mentions.extend([m for m in entity.mentions if m not in existing_entity.mentions])
-
-                # Update graph node attributes explicitly for existing nodes
-                if entity.id in self.graph:
-                    self.graph.nodes[entity.id]['name'] = existing_entity.name
-                    self.graph.nodes[entity.id]['type'] = existing_entity.entity_type
-                    self.graph.nodes[entity.id]['document_ids'] = json.dumps(existing_entity.document_ids)
-                    self.graph.nodes[entity.id]['related_chunks'] = json.dumps(existing_entity.related_chunks)
-                    self.graph.nodes[entity.id]['mentions'] = json.dumps(existing_entity.mentions)
-
-        for entity in entities:
-            for chunk_id in entity.related_chunks:
-                if chunk_id in self.graph and entity.id in self.graph:
-                    # MENTIONS/MENTIONED_IN edges
-                    # These have simple string attributes, should be fine
-                    if self.graph.get_edge_data(chunk_id, entity.id, key='MENTIONS') is None:
-                        self.graph.add_edge(chunk_id, entity.id, key='MENTIONS', relation_type='MENTIONS', confidence=1.0)
-                    if self.graph.get_edge_data(entity.id, chunk_id, key='MENTIONED_IN') is None:
-                        self.graph.add_edge(entity.id, chunk_id, key='MENTIONED_IN', relation_type='MENTIONED_IN', confidence=1.0)
-                else:
-                    logger.debug(f"Skipping MENTIONS relation: Chunk {chunk_id} or Entity {entity.id} not found in graph for direct linking.")
-
-        # Add relations (between entities)
-        added_relation_tuples = set()
-
-        for relation in relations:
-            # Ensure both source and target nodes exist in the graph before adding edge
-            if relation.source_entity in self.graph and relation.target_entity in self.graph:
-                relation_tuple = (relation.source_entity, relation.target_entity, relation.relation_type)
-                if relation_tuple not in added_relation_tuples:
-                    if self.graph.get_edge_data(relation.source_entity, relation.target_entity, key=relation.id) is None:
-                        self.relations[relation.id] = relation
-                        # Ensure relation attributes are GML-compatible (strings, not None)
-                        edge_attrs = {
-                            'relation_type': relation.relation_type,
-                            'confidence': float(relation.confidence), # GML might prefer float over numpy types or specific precision
-                            'document_id': relation.document_id if relation.document_id is not None else "N/A", # Handle None
-                            'sentence': relation.sentence if relation.sentence is not None else "N/A" # Handle None
-                        }
-                        self.graph.add_edge(
-                            relation.source_entity,
-                            relation.target_entity,
-                            key=relation.id,
-                            **edge_attrs
-                        )
-                        added_relation_tuples.add(relation_tuple)
-            else:
-                logger.warning(f"Skipping relation {relation.id}: source ({relation.source_entity}) or target ({relation.target_entity}) entity not in graph during relation addition.")
-
     def save_graph(self) -> bool:
-        """Saves the NetworkX graph and associated entity/relation data."""
+        """
+        For Neo4j, data is persistent. This method primarily ensures initial population
+        and saves document-level metadata to a local JSON file for faster global lookups.
+        """
+        if not self.driver:
+            logger.warning("No Neo4j connection, skipping graph save (data already committed).")
+            return False # Indicate that graph wasn't 'saved' to a file if Neo4j is primary
+
         try:
-            # KG_GRAPH_PATH is a Path object, so convert to string
-            nx.write_gml(self.graph, str(KG_GRAPH_PATH))
-
-            with open(KG_ENTITIES_PATH, 'w', encoding='utf-8') as f:
-                json.dump({eid: entity.to_dict() for eid, entity in self.entities.items()}, f, indent=2)
-            with open(KG_RELATIONS_PATH, 'w', encoding='utf-8') as f:
-                json.dump({rid: relation.to_dict() for rid, relation in self.relations.items()}, f, indent=2)
-
-            # Save document chunks (metadata only, no embeddings)
-            chunks_to_save = {cid: chunk.to_dict() for cid, chunk in self.document_chunks.items()}
-            for cid in chunks_to_save:
-                # Ensure embedding is None or removed before JSON serialization
-                if 'embedding' in chunks_to_save[cid]:
-                    chunks_to_save[cid]['embedding'] = None
-            with open(KG_CHUNKS_PATH, 'w', encoding='utf-8') as f:
-                json.dump(chunks_to_save, f, indent=2)
-
-            logger.info("Knowledge Graph and associated data saved.")
+            # The add_data methods already commit to Neo4j.
+            # This 'save_graph' is now mostly about persisting the
+            # all_document_metadata to a local JSON for quick access.
+            with open(KG_DOC_METADATA_PATH, 'w', encoding='utf-8') as f:
+                json.dump(self.all_document_metadata, f, indent=2)
+            logger.info("Document-level metadata (authors, titles) saved locally.")
             return True
         except Exception as e:
-            logger.error(f"Error saving Knowledge Graph: {e}")
+            logger.error(f"Error saving local document metadata: {e}")
             return False
 
     def load_graph(self) -> bool:
-        """Loads the NetworkX graph and associated entity/relation data."""
+        """
+        For Neo4j, the graph is loaded by connecting to the database.
+        This method will also load the local `all_document_metadata.json` for efficiency.
+        It does NOT load graph structure from GML.
+        """
+        if not self.driver:
+            logger.warning("Neo4j driver not initialized, skipping graph load.")
+            return False
+        
+        # Check if Neo4j has any data. If not, trigger full reprocessing later.
+        try:
+            with self.driver.session() as session:
+                result = session.run("MATCH (n) RETURN count(n) AS node_count")
+                node_count = result.single()["node_count"]
+                if node_count > 0:
+                    logger.info(f"Neo4j database contains {node_count} nodes. Assuming graph is loaded.")
+                    # Repopulate in-memory caches from Neo4j
+                    self._repopulate_in_memory_caches_from_neo4j()
+                    # After repopulating caches, attempt to load document-level metadata locally
+                    if KG_DOC_METADATA_PATH.exists():
+                        try:
+                            with open(KG_DOC_METADATA_PATH, 'r', encoding='utf-8') as f:
+                                self.all_document_metadata = json.load(f)
+                            logger.info(f"Local document-level metadata loaded: {len(self.all_document_metadata)} documents.")
+                            return True # Indicate successful load (of graph state and metadata)
+                        except Exception as e:
+                            logger.error(f"Error loading local document-level metadata: {e}")
+                            self.all_document_metadata = {}
+                            return False # Consider it a partial load success if Neo4j is up.
+                    else:
+                        logger.info("No local document-level metadata file found. Will extract during processing.")
+                        return True # Neo4j is up, so it counts as loaded, even if local metadata needs recreating
+                else:
+                    logger.info("Neo4j database is empty. Will re-process documents.")
+                    return False # No data in Neo4j, so it's not "loaded" yet
+        except Exception as e:
+            logger.error(f"Failed to query Neo4j for node count: {e}. Assuming empty or unreachable.")
+            return False
 
-        if (KG_GRAPH_PATH.exists() and KG_ENTITIES_PATH.exists() and
-            KG_RELATIONS_PATH.exists() and KG_CHUNKS_PATH.exists()):
-            try:
-                self.graph = nx.read_gml(str(KG_GRAPH_PATH))
+    def _repopulate_in_memory_caches_from_neo4j(self):
+        """Repopulates in-memory `self.entities` and `self.document_chunks` from Neo4j."""
+        if not self.driver:
+            return
 
-                with open(KG_ENTITIES_PATH, 'r', encoding='utf-8') as f:
-                    self.entities = {eid: KnowledgeEntity.from_dict(data) for eid, data in json.load(f).items()}
-                with open(KG_RELATIONS_PATH, 'r', encoding='utf-8') as f:
-                    self.relations = {rid: KnowledgeRelation.from_dict(data) for rid, data in json.load(f).items()}
-                with open(KG_CHUNKS_PATH, 'r', encoding='utf-8') as f:
-                    self.document_chunks = {cid: DocumentChunk.from_dict(data) for cid, data in json.load(f).items()}
+        logger.info("Repopulating in-memory caches from Neo4j...")
+        try:
+            with self.driver.session() as session:
+                # Load all entities
+                entities_records = session.run("""
+                    MATCH (e:Entity) RETURN e.id AS id, e.name AS name, e.type AS entity_type, 
+                    e.confidence AS confidence, e.mentions AS mentions_json
+                """)
+                for record in entities_records:
+                    data = record.data()
+                    # Ensure mentions_json is parsed back to list
+                    mentions = json.loads(data['mentions_json']) if data['mentions_json'] else []
+                    # For document_ids and related_chunks, these need to be queried relationally if not stored on the entity node directly.
+                    # For simplicity, we'll recreate a basic entity for the cache.
+                    self.entities[data['id']] = KnowledgeEntity(
+                        id=data['id'],
+                        name=data['name'],
+                        entity_type=data['entity_type'],
+                        confidence=data.get('confidence', 1.0),
+                        document_ids=[], # These are not stored on entity node in Neo4j (relationship-based)
+                        related_chunks=[], # These are not stored on entity node in Neo4j (relationship-based)
+                        mentions=mentions
+                    )
+                logger.info(f"Repopulated {len(self.entities)} entities in memory cache.")
 
-                logger.info(f"Knowledge Graph loaded. Nodes: {self.graph.number_of_nodes()}, Edges: {self.graph.number_of_edges()}")
-                return True
-            except Exception as e:
-                logger.error(f"Error loading Knowledge Graph, restarting from scratch: {e}")
-                self.graph = nx.MultiDiGraph()
-                return False
-        logger.info("No existing Knowledge Graph found. Starting fresh.")
-        return False
+                # Load all documents and authors for all_document_metadata
+                doc_metadata_records = session.run("""
+                    MATCH (d:Document) 
+                    OPTIONAL MATCH (a:Author)-[:AUTHORED]->(d)
+                    RETURN d.id AS doc_id, d.title AS title, COLLECT(DISTINCT a.name) AS authors
+                """)
+                for record in doc_metadata_records:
+                    data = record.data()
+                    self.all_document_metadata[data['doc_id']] = {
+                        'title': data['title'],
+                        'authors': data['authors'] if data['authors'] else []
+                    }
+                logger.info(f"Repopulated {len(self.all_document_metadata)} document metadata in memory cache.")
 
-# 6. QUERY PROCESSOR
-# =============================================================================
+                # Load all chunks for document_chunks cache
+                chunk_records = session.run("""
+                    MATCH (c:Chunk) RETURN c.id AS id, c.document_id AS document_id, c.content AS content,
+                    c.chunk_index AS chunk_index, c.section_title AS section_title,
+                    c.subsection_title AS subsection_title, c.page_number AS page_number
+                """)
+                for record in chunk_records:
+                    data = record.data()
+                    # Embedding is not stored in Neo4j directly for chunks, so it will be None
+                    self.document_chunks[data['id']] = DocumentChunk(
+                        id=data['id'],
+                        document_id=data['document_id'],
+                        content=data['content'],
+                        chunk_index=data['chunk_index'],
+                        section_title=data.get('section_title'),
+                        subsection_title=data.get('subsection_title'),
+                        page_number=data.get('page_number')
+                    )
+                logger.info(f"Repopulated {len(self.document_chunks)} chunks in memory cache.")
+
+        except Exception as e:
+            logger.error(f"Error repopulating in-memory caches from Neo4j: {e}")
+
 
 class QueryProcessor:
     def __init__(self):
@@ -1453,6 +1648,23 @@ class QueryProcessor:
             sub_queries.append("How the multiplication rate quantifies marine heatwave impact")
         if "data sources" in query_lower or "what data was used" in query_lower or "data sets" in query_lower:
             sub_queries.append("Critical data sources for probabilistic analysis")
+        if "all documents" in query_lower or "every document" in query_lower:
+            if "authors" in query_lower or "written by" in query_lower:
+                query_type = 'global_authors'
+            elif "list documents" in query_lower or "documents you have" in query_lower:
+                query_type = 'global_document_list'
+        
+        # NEW: Identify queries asking for papers by specific authors
+        author_keywords = ['papers', 'articles', 'documents', 'works', 'written by', 'authored by']
+        # Filter for PERSON entities that are explicitly named in the query
+        person_entities_in_query = [e['text'] for e in entities if e['label'] == 'PERSON']
+
+        if any(kw in query_lower for kw in author_keywords) and person_entities_in_query:
+            query_type = 'papers_by_author'
+            logger.info(f"Identified 'papers_by_author' query for entities: {person_entities_in_query}")
+            # Ensure extracted_entity_names contains only PERSON entities relevant for this query if needed by retrieval
+            extracted_entity_names = person_entities_in_query # Override entities for this specific query_type
+
 
         # Extract specific methodological terms for targeted retrieval
         methodological_terms = []
@@ -1471,7 +1683,7 @@ class QueryProcessor:
             'original_query': query,
             'query_type': query_type,
             'keywords': keywords,
-            'entities': extracted_entity_names,
+            'entities': extracted_entity_names, # This now correctly holds just PERSON entities for 'papers_by_author'
             'complexity': 'simple' if len(query.split()) < 5 else 'medium' if len(query.split()) < 15 else 'complex',
             'sub_queries': sub_queries, # NEW
             'methodological_terms': methodological_terms # NEW
@@ -1487,9 +1699,6 @@ class QueryProcessor:
             resolved.append(resolved_ent)
         return resolved
 
-
-# 7. HYBRID RETRIEVAL ENGINE
-# =============================================================================
 
 class HybridRetrievalEngine:
     def __init__(self, vector_index: VectorIndexManager, kg_manager: KnowledgeGraphManager, embedding_service: EmbeddingService):
@@ -1507,6 +1716,13 @@ class HybridRetrievalEngine:
 
         all_candidates = []
         seen_chunk_ids = set()
+
+        if query_analysis['query_type'] == 'global_authors':
+            return self._retrieve_all_authors()
+        elif query_analysis['query_type'] == 'papers_by_author': # NEW path
+            return self._retrieve_papers_by_author(query_analysis['entities']) # Pass extracted PERSON entities
+        elif query_analysis['query_type'] == 'global_document_list': # NEW path
+            return self._retrieve_all_documents() # Handle "list all documents"
 
         # 1. Retrieve based on the original query
         original_query_embedding = self.embedding_service.get_embedding(query)
@@ -1547,30 +1763,146 @@ class HybridRetrievalEngine:
         # Use the consolidated `seen_chunk_ids` from multi-stage retrieval
 
         for item in kg_related_info:
-            if item['type'] == 'CHUNK':
-                chunk_id = item['id']
-                if chunk_id not in seen_chunk_ids: # Ensure it's not already added from vector search
-                    chunk_data = self.vector_index.chunk_metadata.get(chunk_id)
-                    if chunk_data:
-                        kg_score = max(0.1, 1.0 - (item['distance_from_query_entity'] * 0.2))
-                        candidate_chunk = {
-                            'chunk_id': chunk_id,
-                            'similarity_score': kg_score,
-                            'content': chunk_data.get('content', ''),
-                            'document_id': chunk_data.get('document_id', ''),
-                            'keywords': chunk_data.get('keywords', []),
-                            'entities': chunk_data.get('entities', []),
-                            'section_title': chunk_data.get('section_title'), # NEW
-                            'subsection_title': chunk_data.get('subsection_title'), # NEW
-                            'page_number': chunk_data.get('page_number') # NEW
-                        }
-                        enhanced_candidates.append(candidate_chunk)
-                        seen_chunk_ids.add(chunk_id)
-
+            # For Neo4j, get_related_info returns a mix of node types.
+            # We want to primarily return chunks for LLM synthesis for general queries.
+            # Convert other node types (Entities, Documents) into summary chunks if they are not too complex.
+            # Or retrieve actual chunks linked to them if distance is small.
+            if item['type'] == 'Chunk': # Neo4j label is 'Chunk', not 'CHUNK' by default
+                chunk_id = str(item['id']) # Neo4j ID is int, convert to string
+                if chunk_id not in seen_chunk_ids:
+                    # In this Neo4j version, the 'chunk_data' comes directly from the Neo4j query result
+                    # not from vector_index.chunk_metadata.
+                    candidate_chunk = {
+                        'chunk_id': chunk_id,
+                        'similarity_score': max(0.1, 1.0 - (item.get('distance_from_query_entity', 0) * 0.2)), # Base score on KG distance
+                        'content': item.get('content_snippet', ''),
+                        'document_id': item.get('document_id', ''),
+                        'keywords': [], # Not directly returned by get_related_info for Neo4j for now
+                        'entities': [],  # Not directly returned by get_related_info for Neo4j for now
+                        'section_title': item.get('section_title'),
+                        'subsection_title': item.get('subsection_title'),
+                        'page_number': item.get('page_number')
+                    }
+                    all_candidates.append(candidate_chunk)
+                    seen_chunk_ids.add(chunk_id)
+            elif item['type'] in ['Entity', 'Document', 'Author']: # Also consider adding context for related entities/documents
+                # Create a synthetic chunk or retrieve actual chunks related to these entities/documents
+                entity_or_doc_id = str(item['id'])
+                if entity_or_doc_id not in seen_chunk_ids: # Use this ID as a 'chunk_id' for uniqueness in candidates list
+                    
+                    # Try to retrieve related chunks directly from Neo4j
+                    related_chunks_from_entity = []
+                    if self.kg_manager.driver:
+                        with self.kg_manager.driver.session() as session:
+                            # Find chunks related to this entity/document
+                            query_related_chunks = """
+                            MATCH (n) WHERE ID(n) = $node_id
+                            MATCH (n)-[:MENTIONED_IN_CHUNK|FROM_DOCUMENT|AUTHORED]-(c:Chunk)
+                            RETURN c.id AS id, c.content AS content, c.document_id AS document_id,
+                                   c.page_number AS page_number, c.section_title AS section_title, c.subsection_title AS subsection_title
+                            LIMIT 3
+                            """
+                            related_chunk_records = session.run(query_related_chunks, node_id=int(entity_or_doc_id))
+                            for rc in related_chunk_records:
+                                rc_data = rc.data()
+                                related_chunks_from_entity.append({
+                                    'chunk_id': str(rc_data['id']),
+                                    'similarity_score': max(0.1, 0.8 - (item.get('distance_from_query_entity', 0) * 0.2)), # Lower score for indirectly retrieved chunks
+                                    'content': rc_data['content'],
+                                    'document_id': rc_data['document_id'],
+                                    'keywords': [],
+                                    'entities': [],
+                                    'section_title': rc_data.get('section_title'),
+                                    'subsection_title': rc_data.get('subsection_title'),
+                                    'page_number': rc_data.get('page_number')
+                                })
+                    
+                    # Add these related chunks to all_candidates
+                    for rc_candidate in related_chunks_from_entity:
+                        if rc_candidate['chunk_id'] not in seen_chunk_ids:
+                            all_candidates.append(rc_candidate)
+                            seen_chunk_ids.add(rc_candidate['chunk_id'])
+        
         # 5. Apply Re-ranking (Cross-encoder or RRF)
-        final_results = self._rank_results(enhanced_candidates, query_analysis, query, top_k)
+        final_results = self._rank_results(all_candidates, query_analysis, query, top_k)
 
         return final_results[:top_k]
+
+    def _retrieve_all_authors(self) -> List[Dict[str, Any]]:
+        all_authors = set()
+        
+        # Now retrieve authors directly from Neo4j for the most up-to-date info
+        if not self.kg_manager.driver:
+            logger.warning("No Neo4j connection, cannot retrieve all authors.")
+            return []
+
+        try:
+            with self.kg_manager.driver.session() as session:
+                result = session.run("MATCH (a:Author) RETURN DISTINCT a.name AS author_name")
+                for record in result:
+                    all_authors.add(record["author_name"])
+            logger.info(f"Retrieved {len(all_authors)} authors from Neo4j.")
+        except Exception as e:
+            logger.error(f"Failed to retrieve all authors from Neo4j: {e}")
+            return [] # Return empty list on error
+
+        # This method is tailored to return a simplified list of authors
+        # as 'content' for the ResponseGenerator's global_authors path.
+        # It doesn't need to pass source details per author here,
+        # as ResponseGenerator will re-derive them from kg_manager.all_document_metadata (local cache or Neo4j).
+        return [{'content': author, 'document_id': 'Aggregated', 'metadata': {'type': 'author_list'}} for author in sorted(list(all_authors))]
+
+
+    def _retrieve_papers_by_author(self, author_names: List[str]) -> List[Dict[str, Any]]:
+        results = []
+        if not self.kg_manager.driver:
+            logger.warning("No Neo4j connection, cannot retrieve papers by author.")
+            return []
+
+        # Convert query author names to lowercase for case-insensitive matching
+        query_author_names_lower = [name.lower() for name in author_names]
+
+        try:
+            with self.kg_manager.driver.session() as session:
+                # Query for papers (Documents) written by specified authors
+                cypher_query = """
+                UNWIND $query_author_names AS q_author_name_lower
+                MATCH (a:Author)
+                WHERE toLower(a.name) = q_author_name_lower
+                MATCH (a)-[:AUTHORED]->(d:Document)
+                OPTIONAL MATCH (other_a:Author)-[:AUTHORED]->(d)
+                RETURN 
+                    d.id AS doc_id, 
+                    d.title AS title, 
+                    COLLECT(DISTINCT other_a.name) AS authors_of_doc
+                """
+                records = session.run(cypher_query, query_author_names=query_author_names_lower)
+                
+                seen_doc_ids = set() # Ensure unique documents in results
+                for record in records:
+                    doc_id = record["doc_id"]
+                    if doc_id not in seen_doc_ids:
+                        results.append({
+                            'content': record["title"], # Paper title
+                            'document_id': doc_id,
+                            'metadata': {
+                                'type': 'document_title_by_author',
+                                'authors': record["authors_of_doc"] if record["authors_of_doc"] else [],
+                                'title': record["title"]
+                            },
+                            'similarity_score': 1.0 # Direct lookup, so high confidence
+                        })
+                        seen_doc_ids.add(doc_id)
+
+        except Exception as e:
+            logger.error(f"Failed to retrieve papers by author from Neo4j: {e}")
+            return [] # Return empty list on error
+        
+        if not results:
+            logger.info(f"No papers found for authors: {author_names} via Neo4j lookup.")
+
+        return results
+
 
     def _enhance_and_boost_candidates(self, candidates: List[Dict[str, Any]], query_analysis: Dict[str, Any], kg_related_info: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """ Enhance and boost scores of candidates based on KG relatedness, keyword overlap, section relevance, and specific terms. """
@@ -1602,12 +1934,14 @@ class HybridRetrievalEngine:
 
             is_kg_related = False
             for kg_item in kg_related_info:
-                if kg_item['type'] == 'CHUNK' and kg_item['id'] == result['chunk_id']:
+                # Note: `item['type']` from Neo4j will be 'Chunk', 'Entity', 'Document', 'Author'
+                if kg_item['type'] == 'Chunk' and str(kg_item['id']) == result['chunk_id']: # Match Neo4j ID with chunk_id
                     is_kg_related = True
                     break
-                if kg_item['type'] != 'CHUNK' and any(e['id'] == kg_item['id'] for e in result.get('entities', [])):
-                    is_kg_related = True
-                    break
+                # If a retrieved entity from Neo4j matches an entity associated with this candidate chunk
+                # this is more complex if entities are no longer mapped directly to chunk.entities in the same way.
+                # For now, let's simplify and assume the above check is sufficient for chunks.
+                # Direct entity-to-entity relations would apply to the KG-derived context, not direct chunk boosting.
             if is_kg_related:
                 initial_score *= 1.1
 
@@ -1634,7 +1968,7 @@ class HybridRetrievalEngine:
         return enhanced_results
 
     def _rank_results(self, results: List[Dict[str, Any]], query_analysis: Dict[str, Any], query_text: str, top_k: int) -> List[Dict[str, Any]]:
-        """  Final ranking of results, potentially using a cross-encoder for re-scoring. Applies diversity filtering.  """
+        """  Final ranking of results, potentially using a cross-encoder for re-scoring. Applies diversity filtering.  """
 
         # First sort by the enhanced similarity score
         results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
@@ -1652,6 +1986,7 @@ class HybridRetrievalEngine:
             if chunk_id in seen_chunk_ids:
                 continue
 
+            # Apply diversity logic, allowing max 2 chunks per document/section for better coverage
             if doc_id not in seen_document_ids or \
                 (section_title and (section_title not in seen_section_titles or sum(1 for r in diverse_results if r.get('section_title') == section_title) < 2)):
                 diverse_results.append(result)
@@ -1688,21 +2023,198 @@ class HybridRetrievalEngine:
         final_selected_results.sort(key=lambda x: x.get('similarity_score', 0), reverse=True)
         return final_selected_results
 
+    def _retrieve_all_documents(self) -> List[Dict[str, Any]]:
+        """Retrieves metadata for all documents from Neo4j."""
+        results = []
+        if not self.kg_manager.driver:
+            logger.warning("No Neo4j connection, cannot retrieve all documents.")
+            return []
 
-# 8. RESPONSE GENERATOR
-# =============================================================================
+        try:
+            with self.kg_manager.driver.session() as session:
+                # Query all documents and their authors from Neo4j
+                cypher_query = """
+                MATCH (d:Document) 
+                OPTIONAL MATCH (a:Author)-[:AUTHORED]->(d)
+                RETURN 
+                    d.id AS doc_id, 
+                    d.title AS title, 
+                    COLLECT(DISTINCT a.name) AS authors
+                ORDER BY d.title
+                """
+                records = session.run(cypher_query)
+                
+                for record in records:
+                    results.append({
+                        'content': record["title"], # Content will be the title
+                        'document_id': record["doc_id"],
+                        'metadata': {
+                            'type': 'document_summary',
+                            'title': record["title"],
+                            'authors': record["authors"] if record["authors"] else []
+                        },
+                        'similarity_score': 1.0 # Direct lookup, high confidence
+                    })
+            logger.info(f"Retrieved {len(results)} documents from Neo4j.")
+        except Exception as e:
+            logger.error(f"Failed to retrieve all documents from Neo4j: {e}")
+            return []
+        return results
+
 
 class ResponseGenerator:
-    def __init__(self):
+    def __init__(self, kg_manager): # kg_manager is now passed during initialization
         self.client = OpenAI(
             api_key=os.getenv("OPENAI_API_KEY"),
         )
         self.llm_model = LLM_MODEL_NAME
         self.tokenizer = tiktoken.encoding_for_model(self.llm_model)
+        self.kg_manager = kg_manager # Store the kg_manager instance
 
     def generate_response(self, query: str, retrieved_chunks: List[Dict[str, Any]], query_analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Generate response from retrieved information using an LLM."""
 
+        # Handle 'global_authors' query type (listing all authors from all documents)
+        if query_analysis['query_type'] == 'global_authors':
+            all_authors = set()
+            document_sources_for_authors = defaultdict(list)
+
+            if self.kg_manager: # Ensure kg_manager is available
+                # For global_authors, retrieve from Neo4j for the most up-to-date data
+                if self.kg_manager.driver:
+                    try:
+                        with self.kg_manager.driver.session() as session:
+                            author_records = session.run("MATCH (a:Author)-[:AUTHORED]->(d:Document) RETURN DISTINCT a.name AS author_name, d.id AS doc_id")
+                            for record in author_records:
+                                author = record["author_name"]
+                                doc_id = record["doc_id"]
+                                all_authors.add(author)
+                                document_sources_for_authors[author].append(doc_id)
+                        logger.info("Successfully retrieved authors and their documents from Neo4j for global_authors query.")
+                    except Exception as e:
+                        logger.error(f"Failed to retrieve authors from Neo4j for global_authors query: {e}")
+                        # Fallback to local cache if Neo4j query fails, but this should ideally be robust
+                        all_doc_metadata = self.kg_manager.get_all_document_metadata() # Fallback to locally loaded cache
+                        for doc_id, doc_meta in all_doc_metadata.items():
+                            if 'authors' in doc_meta and doc_meta['authors']:
+                                for author in doc_meta['authors']:
+                                    all_authors.add(author)
+                                    document_sources_for_authors[author].append(doc_id)
+                else: # No Neo4j driver, fallback to local cache
+                    logger.warning("No Neo4j driver for global_authors query, falling back to local document metadata cache.")
+                    all_doc_metadata = self.kg_manager.get_all_document_metadata()
+                    for doc_id, doc_meta in all_doc_metadata.items():
+                        if 'authors' in doc_meta and doc_meta['authors']:
+                            for author in doc_meta['authors']:
+                                all_authors.add(author)
+                                document_sources_for_authors[author].append(doc_id)
+
+            if all_authors:
+                sorted_authors = sorted(list(all_authors))
+                answer_lines = []
+                for author in sorted_authors:
+                    docs = sorted(list(set(document_sources_for_authors.get(author, []))))
+                    if docs:
+                        answer_lines.append(f"- {author} [Source Document ID: {', '.join(docs)}]")
+                    else:
+                        answer_lines.append(f"- {author} [Source Document ID: Unknown]")
+
+                answer = "The authors of the documents I have are:\n" + "\n".join(answer_lines) + "."
+                
+                overall_sources_list = []
+                seen_overall_doc_ids = set()
+                # Use the collected document_sources_for_authors to build the overall sources list accurately
+                for author_doc_list in document_sources_for_authors.values():
+                    for doc_id in author_doc_list:
+                        if doc_id not in seen_overall_doc_ids:
+                            overall_sources_list.append({'document_id': doc_id})
+                            seen_overall_doc_ids.add(doc_id)
+                overall_sources_list.sort(key=lambda x: x['document_id'])
+
+                return {
+                    'answer': answer,
+                    'confidence': 1.0,
+                    'sources': overall_sources_list
+                }
+            else:
+                return {
+                    'answer': "I do not have information about the authors of all documents.",
+                    'confidence': 0.0,
+                    'sources': []
+                }
+        
+        # Handle 'papers_by_author' query type (listing papers for specific authors)
+        elif query_analysis['query_type'] == 'papers_by_author':
+            papers_by_author_output = defaultdict(set)
+            sources_for_output = []
+            seen_source_docs = set()
+
+            # retrieved_chunks for this query type will contain structured dicts from _retrieve_papers_by_author
+            for item in retrieved_chunks:
+                doc_id = item['document_id']
+                title = item['metadata'].get('title', doc_id)
+                authors_of_doc = item['metadata'].get('authors', [])
+
+                for author in authors_of_doc:
+                    # Filter authors based on query_analysis['entities'] if you want ONLY the requested authors
+                    # If the request was "papers by John Doe", you might only want papers where John Doe is listed.
+                    # Current implementation adds all authors of the paper, which is often desired.
+                    if author in query_analysis['entities'] or not query_analysis['entities']: # If query_analysis['entities'] is empty, list all authors for the paper
+                        papers_by_author_output[author].add(f"'{title}' [Source Document ID: {doc_id}]")
+                
+                if doc_id not in seen_source_docs:
+                    sources_for_output.append({'document_id': doc_id, 'title': title})
+                    seen_source_docs.add(doc_id)
+
+            if papers_by_author_output:
+                answer_lines = []
+                # Sort authors and then papers for consistent output
+                for author in sorted(papers_by_author_output.keys()):
+                    papers = sorted(list(papers_by_author_output[author]))
+                    answer_lines.append(f"- **{author}**:") # Bold the author name
+                    answer_lines.extend([f"  - {paper}" for paper in papers])
+                
+                answer = "Here are the papers written by the requested authors:\n" + "\n".join(answer_lines)
+
+                return {
+                    'answer': answer,
+                    'confidence': 1.0,
+                    'sources': sources_for_output
+                }
+            else:
+                return {
+                    'answer': "I could not find any papers by the specified authors based on the provided information.",
+                    'confidence': 0.0,
+                    'sources': []
+                }
+
+        # Handle 'global_document_list' query type
+        elif query_analysis['query_type'] == 'global_document_list':
+            documents_output = []
+            sources_for_output = [] # This will be the list of all documents themselves
+
+            for item in retrieved_chunks: # retrieved_chunks from _retrieve_all_documents
+                doc_id = item['document_id']
+                title = item['metadata'].get('title', doc_id)
+                authors = ", ".join(item['metadata'].get('authors', [])) if item['metadata'].get('authors') else "Unknown Authors"
+                documents_output.append(f"- '{title}' by {authors} [Source Document ID: {doc_id}]")
+                sources_for_output.append({'document_id': doc_id, 'title': title})
+            
+            if documents_output:
+                answer = "Here are the documents I have:\n" + "\n".join(sorted(documents_output))
+                return {
+                    'answer': answer,
+                    'confidence': 1.0,
+                    'sources': sources_for_output
+                }
+            else:
+                return {
+                    'answer': "I do not have any documents indexed.",
+                    'confidence': 0.0,
+                    'sources': []
+                }
+
+        # This is the original logic for general queries that require LLM synthesis
         if not retrieved_chunks:
             return {
                 'answer': "I couldn't find relevant information to answer your query.",
@@ -1713,11 +2225,11 @@ class ResponseGenerator:
         # Prepare context for the LLM
         full_context_parts = []
         sources_for_output = []
-        seen_source_documents_pages_sections = set() # NEW: To track unique combinations for sources summary
+        seen_source_documents_pages_sections = set() # To track unique combinations for sources summary
 
         current_context_tokens = 0
-        prompt_overhead_tokens = len(self.tokenizer.encode("You are an intelligent assistant designed to provide answers based only on the provided information. Do not use any outside knowledge. If the answer cannot be found in the provided context, state that you cannot answer the question based on the given information. For each statement in your answer, indicate which 'Source Document ID' it came from. If a piece of information is found in multiple sources, you may cite all relevant sources. --- Information: --- Question: ")) + \
-                                len(self.tokenizer.encode(query))
+        prompt_overhead_tokens = len(self.tokenizer.encode("You are an intelligent assistant designed to provide answers based only on the provided information. Do not use any outside knowledge. If the answer cannot be found in the provided context, state that you cannot answer the question based on the given information. For each statement in your answer, you *must* indicate its 'Source Document ID' using the format '[Source Document ID: X]' directly after the relevant text. If a piece of information is derived from multiple provided sources, you may cite all applicable 'Source Document IDs'. --- Information: --- Question: ")) + \
+                                     len(self.tokenizer.encode(query))
 
         available_tokens_for_context = LLM_MAX_TOKENS_CONTEXT - LLM_MAX_TOKENS_RESPONSE - prompt_overhead_tokens
 
@@ -1737,7 +2249,7 @@ class ResponseGenerator:
             chunk_subsection = chunk.get('subsection_title', 'N/A')
             chunk_page = chunk.get('page_number', 'N/A')
 
-            # MODIFIED: Format the chunk content for LLM context, including new metadata
+            # Format the chunk content for LLM context, including new metadata
             formatted_chunk = (
                 f"Source Document ID: {chunk_document_id}\n"
                 f"Page: {chunk_page}\n"
@@ -1751,7 +2263,7 @@ class ResponseGenerator:
                 full_context_parts.append(formatted_chunk)
                 current_context_tokens += chunk_tokens
 
-                # MODIFIED: Prepare sources for the final output, adding new metadata for more context
+                # Prepare sources for the final output, adding new metadata for more context
                 # Deduplicate sources based on document, page, and section for clearer output
                 source_key = (chunk_document_id, chunk_page, chunk_section)
                 if source_key not in seen_source_documents_pages_sections:
@@ -1772,13 +2284,12 @@ class ResponseGenerator:
         full_context = "\n\n".join(full_context_parts)
 
         # Define the prompt for the LLM
-        # --- MODIFIED SYSTEM PROMPT ---
         prompt = f"""
                     You are an intelligent, expert hydrological assistant. Your primary directive is to provide concise, accurate, and comprehensive answers *strictly* based *only* on the provided 'Information' below.
                     Do not use any outside knowledge or information not explicitly present in the given context.
                     
                     **IMPORTANT GUIDELINES:**
-                    1. For *every* statement or piece of factual content in your answer, you *must* indicate its 'Source Document ID' using the format '[Source Document ID: X]' directly after the relevant text. If a piece of information is derived from multiple provided sources, cite all applicable 'Source Document IDs'.
+                    1. For *every* statement or piece of factual content in your answer, you *must* indicate its 'Source Document ID' using the format '[Source Document ID: X]' directly after the relevant text. If a piece of information is derived from multiple provided sources, you may cite all applicable 'Source Document IDs'.
                     2. If the answer to a part of the user's question cannot be found or fully inferred from the provided 'Information', clearly state: "I cannot answer this specific detail definitively based on the provided information."
                     3. Address ALL components of the user's question comprehensively and distinctly. If the question asks for multiple things (e.g., "how X, what Y, and why Z?"), ensure each part is answered in a structured manner (e.g., using bullet points or numbered lists for each sub-question).
                     4. Pay extremely close attention to precise definitions, numerical values, and the *exact purpose and function* of methodologies described in the context. For example, differentiate clearly between different types of thresholds or methods and their intended outcomes (e.g., "MST" for independence of RI events vs. "double-threshold approach" for filtering influential MHWs).
@@ -1791,7 +2302,6 @@ class ResponseGenerator:
 
                     Question: {query}
                     """
-        # --- END MODIFIED SYSTEM PROMPT ---
 
         llm_answer = "An error occurred while generating the response."
         try:
@@ -1823,93 +2333,3 @@ class ResponseGenerator:
             'sources': sources_for_output,
             'context_used_chunks_count': len(full_context_parts)
         }
-
-
-# 9. PERSISTENCE MANAGER
-# =============================================================================
-
-class StorageManager:
-
-    def __init__(self, data_path: Path, storage_path: Path):
-        self.data_path = data_path
-        self.storage_path = storage_path
-        self.storage_path.mkdir(parents=True, exist_ok=True)
-
-    def _calculate_data_hash(self) -> str:
-        """Calculates a hash of all files in the data directory."""
-        hasher = hashlib.md5()
-        file_paths = sorted(list(self.data_path.rglob('*')))
-        for file_path in file_paths:
-            if file_path.is_file():
-                try:
-                    with open(file_path, 'rb') as f:
-                        for chunk in iter(lambda: f.read(4096), b''):
-                            hasher.update(chunk)
-                except Exception as e:
-                    logger.error(f"Error reading file {file_path} for hash calculation: {e}")
-                    continue
-        return hasher.hexdigest()
-
-    def _get_last_data_hash(self) -> Optional[str]:
-        """Reads the last stored data hash."""
-        if LAST_DATA_HASH_PATH.exists():
-            try:
-                return LAST_DATA_HASH_PATH.read_text().strip()
-            except Exception as e:
-                logger.error(f"Error reading last data hash from {LAST_DATA_HASH_PATH}: {e}")
-                return None
-        return None
-
-    def _save_data_hash(self, current_hash: str) -> bool:
-        """Saves the current data hash."""
-        try:
-            LAST_DATA_HASH_PATH.write_text(current_hash)
-            return True
-        except Exception as e:
-            logger.error(f"Error saving data hash to {LAST_DATA_HASH_PATH}: {e}")
-            return False
-
-    def is_data_changed(self) -> bool:
-        """Checks if the data directory has changed since last processing."""
-        current_hash = self._calculate_data_hash()
-        last_hash = self._get_last_data_hash()
-
-        if current_hash != last_hash:
-            logger.info("Data directory has changed or no previous hash found. Re-processing required.")
-            return True
-        logger.info("Data directory is unchanged. Loading pre-calculated data.")
-        return False
-
-    def save_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager):
-        """Saves all relevant data structures. Only saves hash if all saves succeed."""
-        all_saves_successful = True
-
-        if not vector_index_manager.save_index():
-            all_saves_successful = False
-            logger.error("Failed to save FAISS index. Skipping data hash update.")
-
-        if not kg_manager.save_graph():
-            all_saves_successful = False
-            logger.error("Failed to save Knowledge Graph. Skipping data hash update.")
-
-        if all_saves_successful:
-            if self._save_data_hash(self._calculate_data_hash()):
-                logger.info("All data structures and data hash saved successfully.")
-            else:
-                logger.error("Failed to save data hash after successful index/graph saves. Data may be inconsistent on next load.")
-        else:
-            logger.error("Some data structures failed to save. Data hash not updated.")
-
-    def load_all(self, vector_index_manager: VectorIndexManager, kg_manager: KnowledgeGraphManager) -> bool:
-        """Loads all relevant data structures. Returns True if successful, False otherwise."""
-        vector_loaded = vector_index_manager.load_index()
-        kg_loaded = kg_manager.load_graph()
-
-        if vector_loaded and kg_loaded and LAST_DATA_HASH_PATH.exists():
-            # Only consider "loaded" if data hash exists, implies previous full save
-            logger.info("All data structures loaded successfully.")
-            return True
-
-        logger.warning("Incomplete or failed load of data structures. Will re-process data.")
-        return False
-

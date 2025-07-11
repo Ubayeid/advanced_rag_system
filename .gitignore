@@ -432,3 +432,6 @@ package-lock.json
 prometheus.yml
 grafana/
 *.prom
+
+neo4j_data/
+# Neo4j database files
