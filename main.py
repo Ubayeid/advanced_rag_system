@@ -731,7 +731,7 @@ class DocumentProcessor:
             if 'mentions' in resolved_data:
                 entity.mentions = resolved_data['mentions']
             entities.append(entity)
-            logger.info(f"DEBUG: Created entity '{entity.name}' (ID: {entity.id}, Type: {entity.entity_type}) from {doc_id}. document_ids: {entity.document_ids}")
+            # logger.info(f"DEBUG: Created entity '{entity.name}' (ID: {entity.id}, Type: {entity.entity_type}) from {doc_id}. document_ids: {entity.document_ids}")
 
         logger.info(f"Extracted {len(entities)} unique canonical entities from document {doc_id}.")
         return entities

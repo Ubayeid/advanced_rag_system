@@ -1,6 +1,16 @@
-# CIROH RAG System
+# CIROH Knowledge Graph & RAG System
 
 A modular, production-ready Retrieval-Augmented Generation (RAG) system for hydrological and scientific document QA, featuring hybrid vector and knowledge graph retrieval, gap analysis, and interactive visualization.
+
+---
+
+## Overview
+
+This project integrates advanced NLP, knowledge graph construction, and retrieval-augmented generation to unify, analyze, and query hydrology-related knowledge. It supports:
+- **Automated data ingestion and entity extraction**
+- **Knowledge graph construction and visualization**
+- **Hybrid retrieval (vector + graph) for robust question answering**
+- **Systematic knowledge gap analysis to identify research opportunities**
 
 ---
 
@@ -13,6 +23,30 @@ A modular, production-ready Retrieval-Augmented Generation (RAG) system for hydr
 - **REST API:** Flask-based API with endpoints for querying and system stats.
 - **Dockerized:** Easy deployment with Docker and Docker Compose.
 - **Configurable:** Environment variables for model selection, chunking, and more.
+
+---
+
+## Workflow
+
+1. **Data Preparation**
+   - Place your PDF or TXT documents in the `data/` directory.
+   - The system cleans, preprocesses, and extracts entities/relationships using NLP.
+
+2. **Knowledge Graph Construction**
+   - Entities and relationships are mapped into a Neo4j-based knowledge graph.
+   - Cross-document integration merges duplicate entities for a unified view.
+
+3. **Query System**
+   - Users can query the system via REST API or web UI.
+   - The system uses both vector similarity and graph traversal to find relevant answers.
+
+4. **Response Generation**
+   - Answers are generated using LLMs, with supporting evidence and source citations.
+   - Results are contextualized and visualized as needed.
+
+5. **Knowledge Gap Analysis**
+   - The system analyzes the graph for sparsely connected or critical nodes.
+   - Generates reports and visualizations in the `storage/` directory, highlighting research gaps and integration needs.
 
 ---
 
@@ -80,6 +114,11 @@ docker-compose up --build
 
 - After document processing, an interactive knowledge graph HTML and a gap analysis report are generated in the `storage/` directory.
 - Visualization generation can be toggled with the `GENERATE_KG_VISUALIZATION` environment variable.
+- The gap analysis report highlights:
+  - Sparsely connected or isolated entities (potential research gaps)
+  - Critical nodes and relationships
+  - Cross-document integration needs
+  - Actionable recommendations and metrics
 
 ---
 
@@ -119,3 +158,6 @@ MIT License (add your license here)
 - [spaCy](https://spacy.io/)
 - [FAISS](https://github.com/facebookresearch/faiss)
 - [OpenAI GPT](https://platform.openai.com/)
+- [Neo4j](https://neo4j.com/)
+- [Plotly](https://plotly.com/)
+- [Matplotlib](https://matplotlib.org/)
