@@ -15,6 +15,8 @@ import spacy
 import os
 import logging
 from dotenv import load_dotenv
+import uuid
+import re
 
 # Neo4j specific import
 from neo4j import GraphDatabase, basic_auth, exceptions as neo4j_exceptions
@@ -24,6 +26,16 @@ logger = logging.getLogger(__name__)
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://localhost:7687")
 NEO4J_USERNAME = os.getenv("NEO4J_USERNAME", "neo4j")
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password")
+
+# Research domain keywords for hypothesis generation
+RESEARCH_DOMAINS = {
+    'hydrology': ['water', 'flow', 'river', 'basin', 'precipitation', 'evaporation', 'groundwater', 'surface water', 'flood', 'drought'],
+    'climate': ['temperature', 'climate', 'weather', 'atmospheric', 'greenhouse', 'emission', 'carbon', 'warming'],
+    'environmental': ['ecosystem', 'biodiversity', 'pollution', 'conservation', 'sustainability', 'environmental'],
+    'geospatial': ['spatial', 'geographic', 'location', 'mapping', 'gis', 'remote sensing', 'satellite'],
+    'modeling': ['model', 'simulation', 'prediction', 'forecast', 'algorithm', 'computational'],
+    'data_science': ['machine learning', 'ai', 'data analysis', 'statistics', 'big data', 'analytics']
+}
 
 class KnowledgeGraphVisualizer:
     """Enhanced visualizer for the Neo4j-backed knowledge graph"""
@@ -122,255 +134,217 @@ class KnowledgeGraphVisualizer:
         
         return temp_graph
 
-    def visualize_graph_static(self, figsize=(15, 10), save_path=None):
-        """Create a static visualization using matplotlib"""
-        graph_to_visualize = self._fetch_graph_data_from_neo4j()
-
-        if len(graph_to_visualize.nodes()) == 0:
-            logger.warning("No nodes in the graph to visualize for static plot.")
-            return
-
-        plt.figure(figsize=figsize)
-
-        pos = nx.spring_layout(graph_to_visualize, k=0.5, iterations=50, seed=42)
-
-        node_types = defaultdict(list)
-        for n in graph_to_visualize.nodes():
-            node_type = graph_to_visualize.nodes[n].get('type', 'UNKNOWN')
-            node_types[node_type].append(n)
-
-        node_color_map = {
-            'CHUNK': 'lightcoral', 'PERSON': 'blue', 'ORG': 'green', 'GPE': 'purple',
-            'STUDY': 'orange', 'WATER_BODY': 'cyan', 'HYDRO_MEASUREMENT': 'yellow',
-            'POLLUTANT': 'red', 'HYDRO_EVENT': 'magenta', 'HYDRO_INFRASTRUCTURE': 'brown',
-            'HYDRO_MODEL': 'lime', 'MISC': 'gray', 'DATE': 'darkblue', 'MONEY': 'darkgreen',
-            'DATASET': 'teal', 'Document': 'lightgreen', 'Author': 'pink', 'UNKNOWN': 'lightgray',
-            'Entity': 'lightblue'
-        }
-
-        for node_type, nodes_list in node_types.items():
-            color = node_color_map.get(node_type, node_color_map['UNKNOWN'])
-            node_size = 300 if node_type == 'CHUNK' else 500 if node_type in ['Document', 'Author'] else 400
-            nx.draw_networkx_nodes(graph_to_visualize, pos, nodelist=nodes_list, node_color=color, node_size=node_size, alpha=0.8, edgecolors='black')
-
-        edge_labels = nx.get_edge_attributes(graph_to_visualize, 'relation_type')
-        nx.draw_networkx_edges(graph_to_visualize, pos, alpha=0.3, width=1, arrowsize=10)
-        nx.draw_networkx_edge_labels(graph_to_visualize, pos, edge_labels=edge_labels, font_size=7, alpha=0.7)
-
-        node_labels = {}
-        for node_id in graph_to_visualize.nodes():
-            node_info = graph_to_visualize.nodes[node_id]
-            node_type = node_info.get('type')
-            if node_type == 'CHUNK':
-                node_labels[node_id] = f"Chunk:{str(node_id)[:4]}..."
-            elif node_type == 'Document':
-                node_labels[node_id] = node_info.get('title', str(node_id)[:8] + '...')
-            elif node_type == 'Author':
-                node_labels[node_id] = node_info.get('name', str(node_id)[:8] + '...')
-            else:
-                node_labels[node_id] = node_info.get('name', str(node_id)[:8] + '...')
+class ResearchHypothesisGenerator:
+    """Generates research hypotheses and directions based on knowledge gaps"""
+    
+    def __init__(self, kg_manager):
+        self.kg_manager = kg_manager
         
-        nx.draw_networkx_labels(graph_to_visualize, pos, labels=node_labels, font_size=7, font_color='black')
-
-        legend_handles = []
-        for node_type, color in node_color_map.items():
-            if node_type != 'UNKNOWN':
-                legend_handles.append(plt.Line2D([0], [0], marker='o', color='w', label=node_type,
-                                                 markerfacecolor=color, markersize=10))
-        plt.legend(handles=legend_handles, bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-
-        plt.title("Knowledge Graph Visualization", size=16)
-        plt.axis('off')
-        plt.tight_layout()
-
-        if save_path:
-            try:
-                plt.savefig(save_path, dpi=300, bbox_inches='tight')
-                logger.info(f"Static graph saved to {save_path}")
-            except Exception as e:
-                logger.error(f"Error saving static graph to {save_path}: {e}")
-
-    def visualize_graph_interactive(self, height=800):
-        """Create an interactive visualization using Plotly"""
-
-        graph_to_visualize = self._fetch_graph_data_from_neo4j()
-
-        if len(graph_to_visualize.nodes()) == 0:
-            logger.warning("No nodes in the graph to visualize for interactive plot.")
-            return None
-
-        pos = nx.spring_layout(graph_to_visualize, k=0.5, iterations=50, seed=42)
-
-        node_x = []
-        node_y = []
-        node_text = []
-        node_size = []
-        node_color = []
-        node_type_map = {
-            'CHUNK': 'lightcoral', 'PERSON': 'blue', 'ORG': 'green', 'GPE': 'purple',
-            'STUDY': 'orange', 'WATER_BODY': 'cyan', 'HYDRO_MEASUREMENT': 'yellow',
-            'POLLUTANT': 'red', 'HYDRO_EVENT': 'magenta', 'HYDRO_INFRASTRUCTURE': 'brown',
-            'HYDRO_MODEL': 'lime', 'MISC': 'gray', 'DATE': 'darkblue', 'MONEY': 'darkgreen',
-            'DATASET': 'teal', 'Document': 'lightgreen', 'Author': 'pink', 'Entity': 'lightblue',
-            'DEFAULT': 'lightgray'
-        }
-
-        for node_id in graph_to_visualize.nodes():
-            x, y = pos[node_id]
-            node_x.append(x)
-            node_y.append(y)
-
-            node_info = graph_to_visualize.nodes[node_id]
-            node_type = node_info.get('type', 'DEFAULT')
+    def _identify_research_domains(self, entities: List[Dict]) -> Dict[str, float]:
+        """Identify which research domains are most relevant based on entity content"""
+        domain_scores = defaultdict(float)
+        
+        for entity in entities:
+            entity_name = entity.get('name', '').lower()
+            entity_type = entity.get('type', '').lower()
             
-            display_name = ""
-            hover_content = f"<b>ID:</b> {node_id}<br><b>Type:</b> {node_type}<br>"
+            for domain, keywords in RESEARCH_DOMAINS.items():
+                for keyword in keywords:
+                    if keyword in entity_name or keyword in entity_type:
+                        domain_scores[domain] += 1.0
+                        
+        # Normalize scores
+        total = sum(domain_scores.values())
+        if total > 0:
+            domain_scores = {k: v/total for k, v in domain_scores.items()}
+            
+        return dict(domain_scores)
+    
+    def _generate_hypotheses(self, gaps: Dict[str, Any], entities: List[Dict]) -> List[Dict[str, Any]]:
+        """Generate specific research hypotheses based on identified gaps"""
+        hypotheses = []
+        
+        # Identify research domains
+        domains = self._identify_research_domains(entities)
+        primary_domain = max(domains.items(), key=lambda x: x[1])[0] if domains else 'general'
+        
+        # Hypothesis 1: Isolated Entities Research
+        isolated_nodes = gaps.get('structural_gaps', {}).get('isolated_nodes', 0)
+        if isolated_nodes > 0:
+            isolated_examples = gaps.get('structural_gaps', {}).get('isolated_node_list', [])
+            hypotheses.append({
+                'type': 'exploratory',
+                'priority': 'high' if isolated_nodes > 5 else 'medium',
+                'title': f'Investigate {primary_domain.title()} Context for Isolated Entities',
+                'hypothesis': f'Isolated entities ({isolated_examples[:3]}) represent unexplored {primary_domain} concepts that could reveal new relationships when studied in broader context.',
+                'research_question': f'What are the underlying {primary_domain} mechanisms connecting these isolated entities to the broader knowledge network?',
+                'methodology': [
+                    'Literature review of isolated entities',
+                    'Cross-document analysis for missing connections',
+                    'Expert interviews in relevant domain',
+                    'Data collection to bridge knowledge gaps'
+                ],
+                'expected_outcomes': [
+                    'New entity relationships discovered',
+                    'Enhanced knowledge graph connectivity',
+                    'Identification of research opportunities'
+                ],
+                'timeline': '3-6 months',
+                'resources_needed': ['Domain experts', 'Additional literature', 'Data collection tools']
+            })
+        
+        # Hypothesis 2: Connectivity Gaps
+        connectivity_ratio = gaps.get('structural_gaps', {}).get('connectivity_ratio', 0)
+        if connectivity_ratio < 0.7:
+            hypotheses.append({
+                'type': 'analytical',
+                'priority': 'high',
+                'title': f'Improve {primary_domain.title()} Knowledge Integration',
+                'hypothesis': f'Low connectivity ratio ({connectivity_ratio:.1%}) indicates fragmented {primary_domain} knowledge that requires systematic integration.',
+                'research_question': f'How can we systematically connect fragmented {primary_domain} knowledge to create a more cohesive understanding?',
+                'methodology': [
+                    'Network analysis of knowledge gaps',
+                    'Systematic literature review',
+                    'Meta-analysis of existing studies',
+                    'Integration framework development'
+                ],
+                'expected_outcomes': [
+                    'Improved knowledge graph connectivity',
+                    'Integration framework for domain knowledge',
+                    'Identification of key bridging concepts'
+                ],
+                'timeline': '6-12 months',
+                'resources_needed': ['Network analysis tools', 'Literature databases', 'Collaboration platforms']
+            })
+        
+        # Hypothesis 3: Entity Coverage Gaps
+        sparse_entities = gaps.get('content_gaps', {}).get('sparse_entities', [])
+        if sparse_entities:
+            hypotheses.append({
+                'type': 'descriptive',
+                'priority': 'medium',
+                'title': f'Expand {primary_domain.title()} Entity Coverage',
+                'hypothesis': f'Sparsely connected entities represent understudied {primary_domain} concepts that could benefit from expanded research coverage.',
+                'research_question': f'What additional information and relationships are needed to fully understand these sparsely connected {primary_domain} entities?',
+                'methodology': [
+                    'Entity relationship mapping',
+                    'Gap analysis in existing literature',
+                    'Expert consultation',
+                    'Targeted data collection'
+                ],
+                'expected_outcomes': [
+                    'Enhanced entity relationships',
+                    'Improved knowledge coverage',
+                    'New research directions identified'
+                ],
+                'timeline': '4-8 months',
+                'resources_needed': ['Domain experts', 'Literature databases', 'Data collection tools']
+            })
+        
+        # Hypothesis 4: Cross-Document Integration
+        cross_doc_entities = gaps.get('entity_coverage', {}).get('cross_document_entities_count', 0)
+        if cross_doc_entities < 10:
+            hypotheses.append({
+                'type': 'integrative',
+                'priority': 'high',
+                'title': f'Develop {primary_domain.title()} Cross-Document Integration Framework',
+                'hypothesis': f'Limited cross-document entity sharing ({cross_doc_entities} entities) indicates need for better integration across {primary_domain} literature.',
+                'research_question': f'How can we systematically integrate {primary_domain} knowledge across multiple documents and sources?',
+                'methodology': [
+                    'Cross-document entity analysis',
+                    'Integration framework development',
+                    'Standardization of entity representation',
+                    'Collaborative knowledge building'
+                ],
+                'expected_outcomes': [
+                    'Improved cross-document integration',
+                    'Standardized entity representation',
+                    'Enhanced knowledge discovery'
+                ],
+                'timeline': '8-12 months',
+                'resources_needed': ['Integration platforms', 'Standardization tools', 'Collaboration networks']
+            })
+        
+        return hypotheses
+    
+    def _generate_research_directions(self, gaps: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Generate specific research directions based on gaps"""
+        directions = []
+        
+        # Direction 1: Data Collection Priorities
+        isolated_nodes = gaps.get('structural_gaps', {}).get('isolated_nodes', 0)
+        if isolated_nodes > 0:
+            directions.append({
+                'category': 'Data Collection',
+                'priority': 'Immediate',
+                'action': f'Collect additional data for {isolated_nodes} isolated entities',
+                'specific_tasks': [
+                    'Identify data sources for isolated entities',
+                    'Design data collection protocols',
+                    'Implement systematic data gathering',
+                    'Validate and integrate new data'
+                ],
+                'success_metrics': [
+                    'Reduction in isolated nodes by 50%',
+                    'Improved entity connectivity',
+                    'Enhanced knowledge coverage'
+                ],
+                'timeline': '2-4 months',
+                'resources': ['Data collection tools', 'Domain experts', 'Validation frameworks']
+            })
+        
+        # Direction 2: Literature Review Priorities
+        connectivity_ratio = gaps.get('structural_gaps', {}).get('connectivity_ratio', 0)
+        if connectivity_ratio < 0.8:
+            directions.append({
+                'category': 'Literature Review',
+                'priority': 'High',
+                'action': 'Conduct systematic literature review to identify missing connections',
+                'specific_tasks': [
+                    'Identify key literature gaps',
+                    'Systematic review of related works',
+                    'Cross-reference analysis',
+                    'Integration of findings'
+                ],
+                'success_metrics': [
+                    'Improved connectivity ratio to >80%',
+                    'Identification of key bridging literature',
+                    'Enhanced understanding of relationships'
+                ],
+                'timeline': '3-6 months',
+                'resources': ['Literature databases', 'Review tools', 'Expert consultation']
+            })
+        
+        # Direction 3: Methodological Development
+        sparse_entities = gaps.get('content_gaps', {}).get('sparse_entities', [])
+        if len(sparse_entities) > 5:
+            directions.append({
+                'category': 'Methodological Development',
+                'priority': 'Medium',
+                'action': 'Develop methods for better entity relationship discovery',
+                'specific_tasks': [
+                    'Analyze current relationship discovery methods',
+                    'Develop improved algorithms',
+                    'Test and validate new approaches',
+                    'Implement systematic relationship discovery'
+                ],
+                'success_metrics': [
+                    'Improved entity relationship coverage',
+                    'Reduced sparse entities by 30%',
+                    'Enhanced knowledge discovery capabilities'
+                ],
+                'timeline': '6-9 months',
+                'resources': ['Algorithm development tools', 'Testing frameworks', 'Validation datasets']
+            })
+        
+        return directions
 
-            if node_type == 'CHUNK':
-                display_name = f"Chunk:{str(node_id)[:4]}..."
-                hover_content += (
-                    f"<b>Document:</b> {node_info.get('document_id', 'N/A')}<br>"
-                    f"<b>Page:</b> {node_info.get('page_number', 'N/A')}<br>"
-                    f"<b>Section:</b> {node_info.get('section_title', 'N/A')}<br>"
-                    f"<b>Content:</b> {node_info.get('content', 'N/A')}"
-                )
-            elif node_type == 'Document':
-                display_name = node_info.get('title', f"Doc:{str(node_id)[:4]}...")
-                hover_content += (
-                    f"<b>Title:</b> {node_info.get('title', 'N/A')}<br>"
-                    f"<b>Filepath:</b> {node_info.get('filepath', 'N/A')}<br>"
-                    f"<b>Authors:</b> {', '.join(node_info.get('authors', []))}"
-                )
-            elif node_type == 'Author':
-                display_name = node_info.get('name', f"Author:{str(node_id)[:4]}...")
-                hover_content += f"<b>Name:</b> {node_info.get('name', 'N/A')}<br>"
-            else:
-                display_name = node_info.get('name', f"{node_type}:{str(node_id)[:4]}...")
-                hover_content += (
-                    f"<b>Name:</b> {node_info.get('name', 'N/A')}<br>"
-                    f"<b>Entity Type:</b> {node_info.get('entity_type', 'N/A')}<br>"
-                    f"<b>Confidence:</b> {node_info.get('confidence', 'N/A')}"
-                )
-
-            incoming_edges = graph_to_visualize.in_edges(node_id, data=True)
-            outgoing_edges = graph_to_visualize.out_edges(node_id, data=True)
-
-            if incoming_edges or outgoing_edges:
-                hover_content += "<br><b>Relations:</b>"
-                for u, v, data in incoming_edges:
-                    source_node_display = graph_to_visualize.nodes[u].get('name', str(u)[:8] + '...') if graph_to_visualize.nodes[u].get('type') not in ['CHUNK', 'Document', 'Author'] else f"{graph_to_visualize.nodes[u].get('type')}:{str(u)[:4]}..."
-                    hover_content += f"<br> &larr; {data.get('relation_type', 'related to')} {source_node_display}"
-                for u, v, data in outgoing_edges:
-                    target_node_display = graph_to_visualize.nodes[v].get('name', str(v)[:8] + '...') if graph_to_visualize.nodes[v].get('type') not in ['CHUNK', 'Document', 'Author'] else f"{graph_to_visualize.nodes[v].get('type')}:{str(v)[:4]}..."
-                    hover_content += f"<br> &rarr; {data.get('relation_type', 'related to')} {target_node_display}"
-
-            node_text.append(hover_content)
-
-            connections = graph_to_visualize.degree(node_id)
-            node_size.append(10 + connections * 3)
-            node_color.append(node_type_map.get(node_type, node_type_map['DEFAULT']))
-
-        node_trace = go.Scatter(
-            x=node_x, y=node_y, text=node_text, mode='markers',
-            hoverinfo='text',
-            marker=dict(size=node_size, color=node_color, line_width=1, line_color='DarkSlateGrey')
-        )
-
-        edge_x = []
-        edge_y = []
-        edge_annotations = []
-
-        for edge in graph_to_visualize.edges(data=True):
-            x0, y0 = pos[edge[0]]
-            x1, y1 = pos[edge[1]]
-            edge_x.extend([x0, x1, None])
-            edge_y.extend([y0, y1, None])
-
-            mid_x = (x0 + x1) / 2
-            mid_y = (y0 + y1) / 2
-
-            text_x_offset = (x1 - x0) * 0.1
-            text_y_offset = (y1 - y0) * 0.1
-
-            edge_length = np.sqrt((x1-x0)**2 + (y1-y0)**2)
-            if edge_length > 0:
-                angle_rad = np.arctan2(y1 - y0, x1 - x0)
-                angle_deg = np.degrees(angle_rad)
-                if angle_deg > 90 or angle_deg < -90:
-                    angle_deg += 180
-
-                edge_annotations.append(
-                    go.layout.Annotation(
-                        x=(mid_x + text_x_offset),
-                        y=(mid_y + text_y_offset),
-                        xref='x', yref='y',
-                        ax=x0, ay=y0,
-                        axref='x', ayref='y',
-                        showarrow=True,
-                        arrowhead=2, arrowsize=1, arrowwidth=1, arrowcolor='gray',
-                        opacity=0.7,
-                        text=edge[2].get('relation_type', 'rel'),
-                        font=dict(size=8, color='darkslategray'),
-                        textangle=angle_deg,
-                        xanchor="center", yanchor="bottom",
-                    )
-                )
-
-        edge_trace = go.Scatter(
-            x=edge_x, y=edge_y, mode='lines',
-            line=dict(width=0.8, color='gray'),
-            hoverinfo='none',
-            opacity=0.7
-        )
-
-        fig = go.Figure(data=[edge_trace, node_trace], layout=go.Layout(
-                            title=dict(text="Interactive Knowledge Graph", font=dict(size=16)),
-                            showlegend=False,
-                            hovermode='closest',
-                            margin=dict(b=20,l=5,r=5,t=40),
-                            annotations=edge_annotations + [
-                                dict(
-                                    text="Node size = number of connections",
-                                    showarrow=False,
-                                    xref="paper", yref="paper",
-                                    x=0.005, y=-0.002,
-                                    xanchor="left", yanchor="bottom",
-                                    font=dict(color="black", size=10)
-                                ),
-                                dict(
-                                    text="<b>Node Types:</b><br>" + "<br>".join([
-                                        f"<span style='color:{color}'>&#9632;</span> {node_type}" for node_type, color in node_type_map.items() if node_type != 'DEFAULT'
-                                    ]),
-                                    showarrow=False,
-                                    xref="paper", yref="paper",
-                                    x=1.0, y=0.98,
-                                    xanchor="right", yanchor="top",
-                                    align="left",
-                                    bgcolor="rgba(255,255,255,0.7)",
-                                    bordercolor="black", borderwidth=1,
-                                    font=dict(size=9)
-                                )
-                            ],
-                            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
-                            height=height
-                        ))
-
-        try:
-            output_html_file = os.path.join(os.getenv("STORAGE_PATH", "./storage"), "knowledge_graph_interactive.html")
-            fig.write_html(output_html_file)
-        except Exception as e:
-            logger.error(f"Error saving interactive graph to HTML: {e}")
-            print(f"Error saving interactive graph to HTML: {e}")
-            return None
-
-        return fig
-
-class KnowledgeGapAnalyzer:
-    """Comprehensive knowledge gap analysis"""
+class EnhancedKnowledgeGapAnalyzer:
+    """Enhanced knowledge gap analysis with research hypothesis generation"""
 
     def __init__(self, kg_manager):
         self.kg_manager = kg_manager
+        self.hypothesis_generator = ResearchHypothesisGenerator(kg_manager)
 
     def _fetch_analysis_data_from_neo4j(self):
         """Fetches necessary data from Neo4j for gap analysis."""
@@ -392,6 +366,77 @@ class KnowledgeGapAnalyzer:
                 data['isolated_nodes_list'] = [r.data() for r in isolated_nodes_result]
                 data['isolated_nodes_count'] = session.run("MATCH (n) WHERE NOT (n)--() RETURN count(n) AS count").single()['count']
 
+                # Entity type distribution
+                entity_types_result = session.run("MATCH (e:Entity) RETURN e.original_entity_type AS type, count(e) AS count")
+                data['entity_type_distribution'] = {r['type']: r['count'] for r in entity_types_result}
+
+                # FIXED: Use COUNT {} instead of size() for sparse entities
+                sparse_entities_result = session.run("""
+                    MATCH (e:Entity)
+                    WITH e, COUNT { (e)--() } AS connections
+                    WHERE connections < 3
+                    RETURN e.name AS name, e.id AS id, connections
+                    ORDER BY connections ASC
+                    LIMIT 10
+                """)
+                data['sparse_entities'] = [r.data() for r in sparse_entities_result]
+
+                # Cross-document entities
+                cross_doc_result = session.run("""
+                    MATCH (e:Entity)-[:MENTIONED_IN]->(d:Document)
+                    WITH e, count(DISTINCT d) AS doc_count
+                    WHERE doc_count > 1
+                    RETURN e.name AS name, doc_count
+                    ORDER BY doc_count DESC
+                    LIMIT 10
+                """)
+                data['cross_document_entity_examples'] = [r.data() for r in cross_doc_result]
+                data['cross_document_entities_count'] = session.run("""
+                    MATCH (e:Entity)-[:MENTIONED_IN]->(d:Document)
+                    WITH e, count(DISTINCT d) AS doc_count
+                    WHERE doc_count > 1
+                    RETURN count(e) AS count
+                """).single()['count']
+
+                # Sparse documents
+                sparse_docs_result = session.run("""
+                    MATCH (d:Document)
+                    OPTIONAL MATCH (e:Entity)-[:MENTIONED_IN]->(d)
+                    WITH d, count(e) AS entity_count
+                    WHERE entity_count < 3
+                    RETURN d.id AS doc_id, entity_count
+                    ORDER BY entity_count ASC
+                    LIMIT 10
+                """)
+                data['sparse_document_examples'] = [r.data() for r in sparse_docs_result]
+                data['sparse_documents_count'] = session.run("""
+                    MATCH (d:Document)
+                    OPTIONAL MATCH (e:Entity)-[:MENTIONED_IN]->(d)
+                    WITH d, count(e) AS entity_count
+                    WHERE entity_count < 3
+                    RETURN count(d) AS count
+                """).single()['count']
+
+                # Average entities per document
+                avg_entities_result = session.run("""
+                    MATCH (d:Document)
+                    OPTIONAL MATCH (e:Entity)-[:MENTIONED_IN]->(d)
+                    WITH d, count(e) AS entity_count
+                    RETURN avg(entity_count) AS avg_entities
+                """)
+                data['average_entities_per_document'] = avg_entities_result.single()['avg_entities'] or 0
+
+                # FIXED: Use COUNT {} instead of size() for node degrees
+                degrees_result = session.run("MATCH (n) RETURN COUNT { (n)--() } AS degree")
+                degrees = [r["degree"] for r in degrees_result]
+                if degrees:
+                    data['degree_distribution'] = {
+                        'min': min(degrees), 'max': max(degrees), 'mean': np.mean(degrees),
+                        'median': np.median(degrees), 'std': np.std(degrees)
+                    }
+                    data['average_degree'] = np.mean(degrees)
+
+                # Build NetworkX graph for connectivity analysis
                 temp_graph = nx.MultiDiGraph()
                 nodes_result = session.run("MATCH (n) RETURN elementId(n) AS id, LABELS(n) AS labels, properties(n) AS properties")
                 for r in nodes_result:
@@ -423,87 +468,19 @@ class KnowledgeGapAnalyzer:
                 data['graph_density'] = nx.density(temp_graph) if temp_graph.number_of_nodes() > 1 else 0
                 data['connectivity_ratio'] = data['largest_component_size'] / data['total_nodes'] if data['total_nodes'] > 0 else 0
 
-                # Node degrees
-                degrees_result = session.run("MATCH (n) RETURN COUNT { (n)--() } AS degree")
-                degrees = [r["degree"] for r in degrees_result]
-                if degrees:
-                    data['degree_distribution'] = {
-                        'min': min(degrees), 'max': max(degrees), 'mean': np.mean(degrees),
-                        'median': np.median(degrees), 'std': np.std(degrees)
-                    }
-                    data['average_degree'] = np.mean(degrees)
-                else:
-                    data['degree_distribution'] = {}
-                    data['average_degree'] = 0
-
-                # Entity type distribution
-                entity_type_dist_result = session.run("MATCH (e:Entity) RETURN e.type AS type, count(e) AS count")
-                data['entity_type_distribution'] = {r["type"]: r["count"] for r in entity_type_dist_result}
-
-                # Sparse entities (entities with few connections)
-                sparse_entities_result = session.run("""
-                    MATCH (e:Entity)
-                    WHERE COUNT { (e)--() } < 2
-                    RETURN elementId(e) AS entity_id, e.name AS name, e.type AS type, COUNT { (e)--() } AS connections
-                    LIMIT 20
-                """)
-                data['sparse_entities'] = [r.data() for r in sparse_entities_result]
-
-                # Cross-document entities
-                cross_doc_entities_result = session.run("""
-                    MATCH (e:Entity)-[:MENTIONED_IN]->(d:Document)
-                    WITH e, COLLECT(DISTINCT elementId(d)) AS doc_ids
-                    WHERE size(doc_ids) > 1
-                    RETURN elementId(e) AS entity_id, e.name AS name, size(doc_ids) AS doc_count
-                    LIMIT 10
-                """)
-                data['cross_document_entity_examples'] = [r.data() for r in cross_doc_entities_result]
-                data['cross_document_entities_count'] = session.run("""
-                    MATCH (e:Entity)-[:MENTIONED_IN]->(d:Document)
-                    WITH e, COLLECT(DISTINCT elementId(d)) AS doc_ids
-                    WHERE size(doc_ids) > 1
-                    RETURN count(DISTINCT e) AS count
-                """).single()['count']
-
-                # Sparse documents (documents with few entities)
-                sparse_docs_result = session.run("""
-                    MATCH (d:Document)
-                    OPTIONAL MATCH (d)<-[:MENTIONED_IN]-(e:Entity)
-                    WITH d, COLLECT(DISTINCT elementId(e)) AS entity_ids
-                    WHERE size(entity_ids) < 3
-                    RETURN elementId(d) AS doc_id, d.title AS title, size(entity_ids) AS entity_count
-                    LIMIT 10
-                """)
-                data['sparse_document_examples'] = [r.data() for r in sparse_docs_result]
-                data['sparse_documents_count'] = session.run("""
-                    MATCH (d:Document)
-                    OPTIONAL MATCH (d)<-[:MENTIONED_IN]-(e:Entity)
-                    WITH d, COLLECT(DISTINCT elementId(e)) AS entity_ids
-                    WHERE size(entity_ids) < 3
-                    RETURN count(DISTINCT d) AS count
-                """).single()['count']
-                
-                # Average entities per document
-                avg_entities_per_doc_result = session.run("""
-                    MATCH (d:Document)
-                    OPTIONAL MATCH (d)<-[:MENTIONED_IN]-(e:Entity)
-                    WITH d, COLLECT(DISTINCT elementId(e)) AS entity_ids
-                    RETURN avg(size(entity_ids)) AS avg_count
-                """).single()
-                data['average_entities_per_document'] = avg_entities_per_doc_result['avg_count'] if avg_entities_per_doc_result else 0
-
         except Exception as e:
             logger.error(f"Error fetching analysis data from Neo4j: {e}")
-            return {'error': f"Failed to fetch analysis data: {e}"}
-        
+            return {'error': str(e)}
+
         return data
 
     def analyze_gaps(self) -> Dict[str, Any]:
-        """Comprehensive gap analysis"""
+        """Comprehensive gap analysis with research hypotheses"""
         analysis_data = self._fetch_analysis_data_from_neo4j()
         if 'error' in analysis_data:
             return analysis_data
 
+        # Initialize analysis dictionary first
         analysis = {
             'structural_gaps': {
                 'total_nodes': analysis_data.get('total_nodes', 0),
@@ -536,9 +513,31 @@ class KnowledgeGapAnalyzer:
                 'sparse_document_examples': [d['doc_id'] for d in analysis_data.get('sparse_document_examples', [])],
                 'average_entities_per_document': analysis_data.get('average_entities_per_document', 0)
             },
+            'research_hypotheses': [],
+            'research_directions': [],
             'recommendations': []
         }
 
+        # Get all entities for hypothesis generation
+        entities = []
+        if self.kg_manager.driver:
+            try:
+                with self.kg_manager.driver.session() as session:
+                    entities_result = session.run("MATCH (e:Entity) RETURN e.name AS name, e.original_entity_type AS type, e.id AS id")
+                    entities = [r.data() for r in entities_result]
+            except Exception as e:
+                logger.error(f"Error fetching entities for hypothesis generation: {e}")
+
+        # Generate research hypotheses and directions
+        try:
+            analysis['research_hypotheses'] = self.hypothesis_generator._generate_hypotheses(analysis, entities)
+            analysis['research_directions'] = self.hypothesis_generator._generate_research_directions(analysis)
+        except Exception as e:
+            logger.error(f"Error generating research hypotheses: {e}")
+            analysis['research_hypotheses'] = []
+            analysis['research_directions'] = []
+
+        # Add connectivity analysis
         if analysis_data.get('total_nodes', 0) > 0:
             try:
                 temp_graph_for_connectivity = self._fetch_graph_data_for_connectivity_analysis()
@@ -569,7 +568,12 @@ class KnowledgeGapAnalyzer:
             except Exception as e:
                 logger.error(f"Error during NetworkX-based connectivity analysis: {e}")
 
-        analysis['recommendations'] = self._generate_recommendations(analysis)
+        # Generate recommendations
+        try:
+            analysis['recommendations'] = self._generate_recommendations(analysis)
+        except Exception as e:
+            logger.error(f"Error generating recommendations: {e}")
+            analysis['recommendations'] = ["Error generating recommendations"]
 
         return analysis
 
@@ -623,69 +627,68 @@ class KnowledgeGapAnalyzer:
         coverage = analysis.get('entity_coverage', {})
 
         if structural.get('isolated_nodes', 0) > 0:
-            recommendations.append(f"Address {structural['isolated_nodes']} isolated nodes ({', '.join(structural['isolated_node_list'][:3])}...) by adding more contextual information in new documents or by enriching existing ones. These nodes are not connected to the main graph.")
+            recommendations.append(f"**PRIORITY 1**: Address {structural['isolated_nodes']} isolated nodes by conducting targeted research on these entities. These represent unexplored research opportunities.")
 
         if structural.get('connectivity_ratio', 0) < 0.7:
-            recommendations.append(f"Improve overall graph connectivity (ratio: {structural.get('connectivity_ratio', 0):.2%}) by ensuring entities and chunks have more cross-references. This will help retrieve more related information.")
+            recommendations.append(f"**PRIORITY 2**: Improve knowledge integration by focusing on cross-document relationships. Current connectivity ratio of {structural.get('connectivity_ratio', 0):.1%} indicates fragmented knowledge.")
 
         if content.get('sparse_entities', []):
-            recommendations.append(f"Expand context for {len(content['sparse_entities'])} sparsely connected entities (e.g., {content['sparse_entities'][0].get('name', content['sparse_entities'][0].get('id'))} with {content['sparse_entities'][0]['connections']} connections). Focus on adding documents or relations that link these entities to others.")
-
-        if content.get('entities_per_document', 0) < 3 and content.get('total_documents', 0) > 0:
-            recommendations.append(f"The average number of entities per document is low ({content.get('entities_per_document', 0):.2f}). Consider refining entity extraction or adding richer documents.")
+            recommendations.append(f"**PRIORITY 3**: Expand research on {len(content['sparse_entities'])} sparsely connected entities. These represent understudied areas with high research potential.")
 
         if connectivity.get('articulation_points', 0) > 0:
-            recommendations.append(f"Strengthen connections around {connectivity['articulation_points']} critical nodes ({', '.join(connectivity['critical_nodes_examples'][:3])}...). These nodes are crucial for graph connectivity, and their removal would partition the graph.")
+            recommendations.append(f"**CRITICAL**: Focus on {connectivity['articulation_points']} critical nodes that are essential for knowledge connectivity. These are high-impact research targets.")
 
-        if connectivity.get('bridges', 0) > 0:
-            recommendations.append(f"There are {connectivity['bridges']} bridge edges. Consider adding redundant paths to connect the components linked by these bridges for improved robustness.")
-
-        if coverage.get('cross_document_entities_count', 0) < 5 and coverage.get('total_entities', 0) > 0:
-            recommendations.append(f"Only {coverage.get('cross_document_entities_count', 0)} entities appear in multiple documents. Add more documents that share common entities to improve knowledge linking and retrieval across your corpus.")
-
-        if coverage.get('sparse_documents_count', 0) > 0:
-            recommendations.append(f"There are {coverage['sparse_documents_count']} documents ({', '.join(coverage['sparse_document_examples'][:3])}...) with very few entities. Review these documents for better entity extraction or consider if they are truly relevant.")
+        if coverage.get('cross_document_entities_count', 0) < 5:
+            recommendations.append(f"**INTEGRATION NEEDED**: Only {coverage.get('cross_document_entities_count', 0)} entities appear across multiple documents. Develop systematic integration approaches.")
 
         if not recommendations:
-            recommendations.append("Knowledge graph structure looks healthy, well-connected, and rich in entities!")
+            recommendations.append("Knowledge graph structure is well-connected and comprehensive. Focus on deepening existing relationships and exploring emerging connections.")
 
         return recommendations
 
-    def create_gap_report(self, save_path=None) -> str:
-        """Create a comprehensive gap analysis report"""
+    def create_enhanced_gap_report(self, save_path=None) -> str:
+        """Create an enhanced gap analysis report with research hypotheses"""
         analysis = self.analyze_gaps()
 
         report = f"""
-# Knowledge Graph Gap Analysis Report
+# Enhanced Knowledge Gap Analysis & Research Directions Report
 Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 
 ## Executive Summary
-{self._create_executive_summary(analysis)}
+{self._create_enhanced_executive_summary(analysis)}
 
 ---
 
-## Structural Analysis
-{self._format_structural_analysis(analysis['structural_gaps'])}
+## Research Hypotheses & Opportunities
+{self._format_research_hypotheses(analysis.get('research_hypotheses', []))}
 
 ---
 
-## Content Analysis
-{self._format_content_analysis(analysis['content_gaps'])}
+## Specific Research Directions
+{self._format_research_directions(analysis.get('research_directions', []))}
 
 ---
 
-## Connectivity Analysis
-{self._format_connectivity_analysis(analysis['connectivity_gaps'])}
+## Knowledge Gap Analysis
+{self._format_enhanced_structural_analysis(analysis['structural_gaps'])}
+{self._format_enhanced_content_analysis(analysis['content_gaps'])}
+{self._format_enhanced_connectivity_analysis(analysis['connectivity_gaps'])}
+{self._format_enhanced_coverage_analysis(analysis['entity_coverage'])}
 
 ---
 
-## Entity Coverage Analysis
-{self._format_coverage_analysis(analysis['entity_coverage'])}
+## Actionable Recommendations
+{self._format_enhanced_recommendations(analysis['recommendations'])}
 
 ---
 
-## Recommendations
-{self._format_recommendations(analysis['recommendations'])}
+## Implementation Roadmap
+{self._create_implementation_roadmap(analysis)}
+
+---
+
+## Success Metrics & Evaluation
+{self._create_success_metrics(analysis)}
 """
 
         if save_path:
@@ -694,78 +697,267 @@ Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
                 with open(save_path, 'w', encoding='utf-8') as f:
                     f.write(report)
             except Exception as e:
-                logger.error(f"Error saving knowledge gap report to {save_path}: {e}")
+                logger.error(f"Error saving enhanced knowledge gap report to {save_path}: {e}")
 
         return report
 
-    def _create_executive_summary(self, analysis):
+    def _create_enhanced_executive_summary(self, analysis):
         structural = analysis.get('structural_gaps', {})
+        hypotheses = analysis.get('research_hypotheses', [])
+        
         return f"""
-The knowledge graph contains **{structural.get('total_nodes', 0)} nodes** and **{structural.get('total_edges', 0)} edges**.
-Graph connectivity ratio: **{structural.get('connectivity_ratio', 0):.2%}**
-Overall graph density: **{structural.get('graph_density', 0):.4f}**
+## Knowledge Graph Overview
+- **Total Knowledge Nodes**: {structural.get('total_nodes', 0)}
+- **Total Relationships**: {structural.get('total_edges', 0)}
+- **Knowledge Connectivity**: {structural.get('connectivity_ratio', 0):.1%}
+- **Research Opportunities Identified**: {len(hypotheses)}
+
+## Key Research Insights
+This analysis reveals **{len(hypotheses)} specific research opportunities** that can advance knowledge in your domain. The knowledge graph shows {structural.get('isolated_nodes', 0)} isolated concepts that represent unexplored research areas, and a connectivity ratio of {structural.get('connectivity_ratio', 0):.1%} indicating {self._get_connectivity_description(structural.get('connectivity_ratio', 0))}.
+
+## Immediate Action Items
+1. **High-Priority Research**: {len([h for h in hypotheses if h.get('priority') == 'high'])} hypotheses identified
+2. **Data Collection Needs**: {structural.get('isolated_nodes', 0)} entities require additional data
+3. **Integration Opportunities**: {analysis.get('entity_coverage', {}).get('cross_document_entities_count', 0)} cross-document entities need systematic integration
 """
 
-    def _format_structural_analysis(self, structural):
+    def _get_connectivity_description(self, ratio):
+        if ratio >= 0.9:
+            return "excellent knowledge integration"
+        elif ratio >= 0.7:
+            return "good knowledge integration with room for improvement"
+        elif ratio >= 0.5:
+            return "moderate knowledge fragmentation requiring attention"
+        else:
+            return "significant knowledge fragmentation requiring immediate action"
+
+    def _format_research_hypotheses(self, hypotheses):
+        if not hypotheses:
+            return "No specific research hypotheses identified at this time."
+        
+        formatted = []
+        for i, hypothesis in enumerate(hypotheses, 1):
+            formatted.append(f"""
+### Hypothesis {i}: {hypothesis['title']}
+**Priority**: {hypothesis['priority'].upper()}
+**Type**: {hypothesis['type'].title()}
+
+**Hypothesis Statement**: {hypothesis['hypothesis']}
+
+**Research Question**: {hypothesis['research_question']}
+
+**Proposed Methodology**:
+{chr(10).join([f"- {method}" for method in hypothesis['methodology']])}
+
+**Expected Outcomes**:
+{chr(10).join([f"- {outcome}" for outcome in hypothesis['expected_outcomes']])}
+
+**Timeline**: {hypothesis['timeline']}
+
+**Resources Required**:
+{chr(10).join([f"- {resource}" for resource in hypothesis['resources_needed']])}
+""")
+        
+        return '\n'.join(formatted)
+
+    def _format_research_directions(self, directions):
+        if not directions:
+            return "No specific research directions identified at this time."
+        
+        formatted = []
+        for direction in directions:
+            formatted.append(f"""
+### {direction['category']}: {direction['action']}
+**Priority**: {direction['priority']}
+
+**Specific Tasks**:
+{chr(10).join([f"- {task}" for task in direction['specific_tasks']])}
+
+**Success Metrics**:
+{chr(10).join([f"- {metric}" for metric in direction['success_metrics']])}
+
+**Timeline**: {direction['timeline']}
+
+**Required Resources**:
+{chr(10).join([f"- {resource}" for resource in direction['resources']])}
+""")
+        
+        return '\n'.join(formatted)
+
+    def _format_enhanced_structural_analysis(self, structural):
         return f"""
-- **Total nodes**: {structural.get('total_nodes', 0)}
-- **Total edges**: {structural.get('total_edges', 0)}
-- **Isolated nodes**: {structural.get('isolated_nodes', 0)} (Examples: {', '.join(structural.get('isolated_node_list', []))})
-- **Connected components**: {structural.get('connected_components', 0)}
-- **Largest component size**: {structural.get('largest_component_size', 0)}
-- **Graph density**: {structural.get('graph_density', 0):.4f}
+## Structural Knowledge Gaps
+
+### Network Overview
+- **Total Knowledge Nodes**: {structural.get('total_nodes', 0)}
+- **Total Relationships**: {structural.get('total_edges', 0)}
+- **Knowledge Connectivity**: {structural.get('connectivity_ratio', 0):.1%}
+- **Graph Density**: {structural.get('graph_density', 0):.4f}
+
+### Critical Issues
+- **Isolated Knowledge Nodes**: {structural.get('isolated_nodes', 0)} entities lack connections
+  - Examples: {', '.join(structural.get('isolated_node_list', [])[:5])}
+  - **Research Impact**: These represent unexplored research opportunities
+- **Connected Components**: {structural.get('connected_components', 0)} separate knowledge clusters
+  - **Largest Component**: {structural.get('largest_component_size', 0)} nodes
+  - **Research Opportunity**: Integration needed between components
 """
 
-    def _format_content_analysis(self, content):
+    def _format_enhanced_content_analysis(self, content):
         return f"""
-- **Total entities**: {content.get('total_entities', 0)}
-- **Total documents (chunks)**: {content.get('total_documents', 0)}
-- **Average entities per document**: {content.get('entities_per_document', 0):.2f}
-- **Sparse entities** (< 2 connections): {len(content.get('sparse_entities', []))} (Examples: {', '.join([e.get('name', e.get('id')) for e in content['sparse_entities'][:3]])})
-- **Entity type distribution**: {content.get('entity_type_distribution', {})}
+## Content Knowledge Gaps
+
+### Entity Coverage
+- **Total Entities**: {content.get('total_entities', 0)}
+- **Entity Types**: {content.get('entity_type_distribution', {})}
+- **Average Entities per Document**: {content.get('entities_per_document', 0):.2f}
+
+### Research Opportunities
+- **Sparsely Connected Entities**: {len(content.get('sparse_entities', []))} entities with limited relationships
+  - **Research Value**: These represent understudied concepts
+  - **Action Required**: Expand research coverage for these entities
 """
 
-    def _format_connectivity_analysis(self, connectivity):
+    def _format_enhanced_connectivity_analysis(self, connectivity):
         return f"""
-- **Average node degree**: {connectivity.get('average_degree', 0):.2f}
-- **Bridge connections**: {connectivity.get('bridges', 0)}
-- **Critical nodes (articulation points)**: {connectivity.get('articulation_points', 0)} (Examples: {', '.join(connectivity.get('critical_nodes_examples', []))})
-- **Degree distribution**: Min={connectivity.get('degree_distribution', {}).get('min', 'N/A')}, Max={connectivity.get('degree_distribution', {}).get('max', 'N/A')}, Mean={connectivity.get('degree_distribution', {}).get('mean', 'N/A'):.2f}, Median={connectivity.get('degree_distribution', {}).get('median', 'N/A'):.2f}, Std={connectivity.get('degree_distribution', {}).get('std', 'N/A'):.2f}
+## Knowledge Connectivity Analysis
+
+### Network Structure
+- **Average Node Degree**: {connectivity.get('average_degree', 0):.2f}
+- **Critical Nodes**: {connectivity.get('articulation_points', 0)} nodes are essential for connectivity
+- **Bridge Connections**: {connectivity.get('bridges', 0)} critical relationships
+
+### Research Implications
+- **Critical Nodes**: {', '.join(connectivity.get('critical_nodes_examples', [])[:5])}
+  - **Research Priority**: These nodes are high-impact research targets
+  - **Risk Assessment**: Loss of these nodes would fragment knowledge
 """
 
-    def _format_coverage_analysis(self, coverage):
+    def _format_enhanced_coverage_analysis(self, coverage):
         return f"""
-- **Cross-document entities**: {coverage.get('cross_document_entities_count', 0)} (Examples: {', '.join(coverage.get('cross_document_entity_examples', []))})
-- **Sparse documents** (< 3 entities): {coverage.get('sparse_documents_count', 0)} (Examples: {', '.join(coverage.get('sparse_document_examples', []))})
-- **Average entities per document (linked)**: {coverage.get('average_entities_per_document', 0):.2f}
+## Cross-Document Knowledge Integration
+
+### Integration Status
+- **Cross-Document Entities**: {coverage.get('cross_document_entities_count', 0)} entities appear in multiple documents
+- **Sparse Documents**: {coverage.get('sparse_documents_count', 0)} documents have limited entity coverage
+
+### Research Needs
+- **Integration Gaps**: Limited cross-document entity sharing indicates fragmentation
+- **Systematic Integration**: Need for frameworks to connect knowledge across documents
 """
 
-    def _format_recommendations(self, recommendations):
-        return '\n'.join([f"- {rec}" for rec in recommendations])
+    def _format_enhanced_recommendations(self, recommendations):
+        return '\n'.join([f"### {rec}" for rec in recommendations])
 
+    def _create_implementation_roadmap(self, analysis):
+        hypotheses = analysis.get('research_hypotheses', [])
+        directions = analysis.get('research_directions', [])
+        
+        roadmap = """
+## Implementation Roadmap
+
+### Phase 1: Immediate Actions (0-3 months)
+"""
+        
+        immediate_actions = []
+        for direction in directions:
+            if direction.get('priority') == 'Immediate':
+                immediate_actions.append(f"- {direction['action']}")
+        
+        if immediate_actions:
+            roadmap += '\n'.join(immediate_actions)
+        else:
+            roadmap += "- Conduct preliminary research on identified gaps\n- Establish research priorities\n- Begin data collection planning"
+        
+        roadmap += """
+
+### Phase 2: Short-term Research (3-6 months)
+"""
+        
+        short_term = []
+        for hypothesis in hypotheses:
+            if '3-6' in hypothesis.get('timeline', '') or '4-8' in hypothesis.get('timeline', ''):
+                short_term.append(f"- {hypothesis['title']}")
+        
+        if short_term:
+            roadmap += '\n'.join(short_term)
+        else:
+            roadmap += "- Implement systematic literature review\n- Begin hypothesis testing\n- Develop integration frameworks"
+        
+        roadmap += """
+
+### Phase 3: Medium-term Development (6-12 months)
+"""
+        
+        medium_term = []
+        for hypothesis in hypotheses:
+            if '6-12' in hypothesis.get('timeline', '') or '8-12' in hypothesis.get('timeline', ''):
+                medium_term.append(f"- {hypothesis['title']}")
+        
+        if medium_term:
+            roadmap += '\n'.join(medium_term)
+        else:
+            roadmap += "- Complete major research initiatives\n- Implement integration frameworks\n- Evaluate and refine approaches"
+        
+        roadmap += """
+
+### Phase 4: Long-term Integration (12+ months)
+- Establish sustainable knowledge integration processes
+- Develop ongoing gap monitoring systems
+- Create collaborative research networks
+- Implement continuous improvement frameworks
+"""
+        
+        return roadmap
+
+    def _create_success_metrics(self, analysis):
+        return """
+## Success Metrics & Evaluation Framework
+
+### Quantitative Metrics
+- **Knowledge Connectivity**: Target >80% connectivity ratio
+- **Isolated Node Reduction**: Reduce isolated nodes by 50%
+- **Cross-Document Integration**: Increase cross-document entities by 100%
+- **Entity Relationship Density**: Improve average node degree by 25%
+
+### Qualitative Metrics
+- **Research Impact**: Number of new research directions identified
+- **Knowledge Integration**: Improved understanding of relationships
+- **Collaboration Enhancement**: Increased cross-disciplinary connections
+- **Innovation Potential**: New hypotheses and research opportunities
+
+### Evaluation Timeline
+- **Monthly**: Progress tracking on immediate actions
+- **Quarterly**: Assessment of short-term research progress
+- **Semi-annually**: Comprehensive gap analysis update
+- **Annually**: Full knowledge graph reassessment
+
+### Success Indicators
+- Reduced knowledge fragmentation
+- Increased research collaboration
+- Enhanced understanding of domain relationships
+- Improved knowledge discovery capabilities
+- Sustainable knowledge integration processes
+"""
+
+# Update the main analysis function to use the enhanced analyzer
 def analyze_rag_knowledge_graph(rag_system):
-    """Analyze and visualize the knowledge graph from a RAG system"""
+    """Analyze the knowledge graph from a RAG system and generate an enhanced gap report."""
+    
+    # Use the enhanced analyzer
+    analyzer = EnhancedKnowledgeGapAnalyzer(rag_system.kg_manager)
 
-    visualizer = KnowledgeGraphVisualizer(rag_system.kg_manager)
-    analyzer = KnowledgeGapAnalyzer(rag_system.kg_manager)
-
-    print("Creating interactive visualization (saved to knowledge_graph_interactive.html)...")
-    fig = visualizer.visualize_graph_interactive()
-    if fig:
-        logger.info("Interactive visualization HTML file generated in your 'storage' directory.")
-
-    print("\nGenerating comprehensive gap analysis report...")
-    report_save_path = os.path.join(os.getenv("STORAGE_PATH", "./storage"), "knowledge_gap_report.md")
-    report = analyzer.create_gap_report(report_save_path)
-    print("Knowledge gap report saved to knowledge_gap_report.md")
+    logger.info("Generating enhanced knowledge gap analysis with research hypotheses...")
+    report_save_path = os.path.join(os.getenv("STORAGE_PATH", "./storage"), "enhanced_knowledge_gap_report.md")
+    report = analyzer.create_enhanced_gap_report(report_save_path)
+    logger.info("Enhanced knowledge gap report saved to enhanced_knowledge_gap_report.md")
 
     detailed_analysis = analyzer.analyze_gaps()
 
     return {
-        'visualization_figure': fig,
         'gap_analysis_data': detailed_analysis,
         'report_content': report
     }
 
 if __name__ == "__main__":
-    logger.info("Run `docker-compose up` to trigger RAG system initialization and graph analysis.")
+    logger.info("Run `docker-compose up` to trigger RAG system initialization and enhanced graph analysis.")

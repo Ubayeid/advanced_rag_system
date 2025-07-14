@@ -1,5 +1,3 @@
-# version: .
-
 services:
   ciroh-rag:
     build: .
@@ -11,35 +9,29 @@ services:
       - ./storage:/app/storage
       - ./cache:/app/cache
     environment:
-      # OpenAI API Key - IMPORTANT: This should be set in your host's .env file.
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      # Neo4j Connection Details - IMPORTANT: Set these in your host's .env file.
-      - NEO4J_URI=${NEO4J_URI:-bolt://neo4j:7687}
-      - NEO4J_USERNAME=${NEO4J_USERNAME:-neo4j}
-      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-12345678} # Change this strong password!
-      # Embedding model configuration with default values
-      - EMBEDDING_MODEL_NAME=${EMBEDDING_MODEL_NAME:-all-MiniLM-L6-v2}
-      - EMBEDDING_DIM=${EMBEDDING_DIM:-384}
-      # LLM configuration with default values
-      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-gpt-3.5-turbo}
-      - LLM_TEMPERATURE=${LLM_TEMPERATURE:-0.7}
-      - LLM_MAX_TOKENS_CONTEXT=${LLM_MAX_TOKENS_CONTEXT:-4000}
-      - LLM_MAX_TOKENS_RESPONSE=${LLM_MAX_TOKENS_RESPONSE:-1000}
-      # Document processing settings with default values
-      - TARGET_CHUNK_SIZE_TOKENS=${TARGET_CHUNK_SIZE_TOKENS:-512}
-      - CHUNK_OVERLAP_SENTENCES=${CHUNK_OVERLAP_SENTENCES:-2}
-      - MIN_CHUNK_SIZE_TOKENS=${MIN_CHUNK_SIZE_TOKENS:-20}
-      # Storage paths, ensuring consistency between Dockerfile and Compose
-      - STORAGE_PATH=${STORAGE_PATH:-./storage}
-      - DATA_PATH=${DATA_PATH:-./data}
-      # Cache settings with default values
-      - ENABLE_CACHE=${ENABLE_CACHE:-true}
-      - CACHE_DIR=${CACHE_DIR:-./cache}
-      - MAX_CONCURRENT_REQUESTS=${MAX_CONCURRENT_REQUESTS:-10}
-      - REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-60}
-      - CACHE_VALIDITY_DAYS=${CACHE_VALIDITY_DAYS:-1}
-      - SPACY_MODEL=${SPACY_MODEL:-en_core_web_sm}
-      - GENERATE_KG_VISUALIZATION=${GENERATE_KG_VISUALIZATION:-true}
+      # Use key: value map style for environment variables
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-12345678} # Change this strong password!
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-all-MiniLM-L6-v2}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-384}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-gpt-3.5-turbo}
+      LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.7}
+      LLM_MAX_TOKENS_CONTEXT: ${LLM_MAX_TOKENS_CONTEXT:-4000}
+      LLM_MAX_TOKENS_RESPONSE: ${LLM_MAX_TOKENS_RESPONSE:-1000}
+      TARGET_CHUNK_SIZE_TOKENS: ${TARGET_CHUNK_SIZE_TOKENS:-512}
+      CHUNK_OVERLAP_SENTENCES: ${CHUNK_OVERLAP_SENTENCES:-2}
+      MIN_CHUNK_SIZE_TOKENS: ${MIN_CHUNK_SIZE_TOKENS:-20}
+      STORAGE_PATH: ${STORAGE_PATH:-./storage}
+      DATA_PATH: ${DATA_PATH:-./data}
+      ENABLE_CACHE: ${ENABLE_CACHE:-true}
+      CACHE_DIR: ${CACHE_DIR:-./cache}
+      MAX_CONCURRENT_REQUESTS: ${MAX_CONCURRENT_REQUESTS:-10}
+      REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-60}
+      CACHE_VALIDITY_DAYS: ${CACHE_VALIDITY_DAYS:-1}
+      SPACY_MODEL: ${SPACY_MODEL:-en_core_web_sm}
+      GENERATE_KG_VISUALIZATION: ${GENERATE_KG_VISUALIZATION:-true}
     depends_on:
       neo4j:
         condition: service_healthy
@@ -57,9 +49,15 @@ services:
     volumes:
       - ./neo4j_data:/data
     environment:
-      - NEO4J_AUTH=${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password} # User/Pass for Neo4j
-      - NEO4J_server_memory_heap_max__size=1G
-      - NEO4J_server_memory_pagecache_size=512M
+      # --- THIS IS THE FINAL CORRECTED SECTION ---
+      # Ensure there's NO hyphen before NEO4J_PLUGINS: >-
+      # This entire 'environment' section for neo4j_db should be a YAML map (dictionary)
+      # where keys are indented and followed by a colon.
+      NEO4J_PLUGINS: >-
+        ["apoc"]
+      NEO4J_AUTH: ${NEO4J_USERNAME:-neo4j}/${NEO4J_PASSWORD:-password}
+      NEO4J_server_memory_heap_max__size: 1G
+      NEO4J_server_memory_pagecache_size: 512M
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
       interval: 5s

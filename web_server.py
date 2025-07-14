@@ -32,11 +32,11 @@ from main import (
 # Import networkx for graph manipulation (NEW ADDITION)
 import networkx as nx
 
-# Import knowledge_graph for visualization if enabled
+# Import knowledge_graph specifically for the analyze_rag_knowledge_graph function
 import knowledge_graph
 
 # Define GENERATE_KG_VISUALIZATION here as it's used in SimpleAdvancedRAGSystem
-GENERATE_KG_VISUALIZATION = os.getenv("GENERATE_KG_VISUALIZATION", "true").lower() == "true"
+GENERATE_KG_VISUALIZATION = os.getenv("GENERATE_KG_VISUALIZATION", "false").lower() == "true" # Set to false by default as per request
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -128,6 +128,7 @@ class StorageManager:
 
         logger.warning("Incomplete or failed load of data structures. Will re-process data.")
         return False
+
 class SimpleAdvancedRAGSystem:
     def __init__(self):
         # Ensure paths exist before initializing components that use them
@@ -143,7 +144,7 @@ class SimpleAdvancedRAGSystem:
 
         self.storage_manager = StorageManager(DATA_PATH, STORAGE_PATH)
         self.doc_processor = DocumentProcessor(self.embedding_service)
-        self.vector_index = VectorIndexManager(embedding_dim=EMBEDDING_DIM)
+        self.vector_index = VectorIndexManager(embedding_dim=EMBEDDING_DIM) # Initial creation
         self.kg_manager = KnowledgeGraphManager()
         self.retrieval_engine = HybridRetrievalEngine(self.vector_index, self.kg_manager, self.embedding_service)
         self.response_generator = ResponseGenerator(kg_manager=self.kg_manager)
@@ -157,19 +158,34 @@ class SimpleAdvancedRAGSystem:
         # Attempt to load existing data
         if self.storage_manager.load_all(self.vector_index, self.kg_manager) and not needs_reprocessing:
             logger.info("Knowledge base is up-to-date. No re-processing needed.")
+            # Still generate report even if not reprocessing data, if desired
+            logger.info("Generating comprehensive gap analysis report with research hypotheses...")
+            try:
+                # Call the enhanced analyze_rag_knowledge_graph function from knowledge_graph.py
+                knowledge_graph.analyze_rag_knowledge_graph(self)
+            except Exception as e:
+                logger.error(f"Error generating enhanced knowledge gap report: {e}")
             return
 
         logger.info("Re-processing documents due to data changes or no prior data found.")
 
-        self.vector_index._initialize_index()
-        self.vector_index.chunk_metadata = {}
-        self.vector_index.id_to_index = {}
-        self.vector_index.index_to_id = {}
-        self.vector_index.current_index = 0
+        # Correct fix: Re-instantiate VectorIndexManager for a completely fresh FAISS index
+        self.vector_index = VectorIndexManager(embedding_dim=EMBEDDING_DIM) 
+        # Crucial: Update retrieval_engine with the new vector_index instance
+        self.retrieval_engine.vector_index = self.vector_index
 
-        self.kg_manager.graph = nx.MultiDiGraph()
+        # Reset KG Manager's in-memory caches, but not the Neo4j driver itself
+        # For Neo4j, simply ensure the database is clear if reprocessing from scratch
+        if self.kg_manager.driver:
+            try:
+                with self.kg_manager.driver.session() as session:
+                    session.run("MATCH (n) DETACH DELETE n") # Clear entire graph
+                logger.info("Neo4j database cleared for full reprocessing.")
+            except Exception as e:
+                logger.error(f"Failed to clear Neo4j database: {e}. Continuing with existing data if any.")
+
         self.kg_manager.entities = {}
-        self.kg_manager.relations = {}
+        self.kg_manager.relations = [] # This is a transient list, can be safely reset
         self.kg_manager.document_chunks = {}
         self.kg_manager.all_document_metadata = {} # Reset document metadata on reprocessing
 
@@ -178,22 +194,13 @@ class SimpleAdvancedRAGSystem:
         self.storage_manager.save_all(self.vector_index, self.kg_manager)
         logger.info("Knowledge base re-processing complete and saved.")
 
-        if GENERATE_KG_VISUALIZATION:
-            logger.info("Generating interactive knowledge graph visualization ...")
-            try:
-                knowledge_graph.analyze_rag_knowledge_graph(self)
-
-                visualizer = knowledge_graph.KnowledgeGraphVisualizer(self.kg_manager)
-                
-                static_graph_save_path = os.path.join(os.getenv("STORAGE_PATH", "./storage"), "knowledge_graph_static.png")
-                
-                visualizer.visualize_graph_static(save_path=static_graph_save_path)
-                logger.info(f"Generating static knowledge graph visualization ...")
-
-            except Exception as e:
-                logger.error(f"Error during knowledge graph visualization/analysis (after reprocessing): {e}")
-        else:
-            logger.info("Skipping knowledge graph visualization and gap report generation as per configuration (GENERATE_KG_VISUALIZATION is false).")
+        # Generate the gap report after processing and saving
+        logger.info("Generating comprehensive gap analysis report with research hypotheses...")
+        try:
+            # Call the enhanced analyze_rag_knowledge_graph function from knowledge_graph.py
+            knowledge_graph.analyze_rag_knowledge_graph(self)
+        except Exception as e:
+            logger.error(f"Error generating enhanced knowledge gap report: {e}")
 
     def _process_and_store_documents(self):
         """Processes documents from the DATA_PATH and stores them."""
